@@ -1,0 +1,26 @@
+# Build artifacts
+build/
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+compile_commands.json
+
+# Executables
+main_time_domain
+
+# OS / IDE
+.DS_Store
+.vscode/
+.cache/
+.cmake/
+*.code-workspace
+
+# Dev logs
+DEVLOG_*.md
+log.md
+log.txt
+note.md
+cable_solver
+example_rupture
+example_using_Network
