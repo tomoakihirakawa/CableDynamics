@@ -6,8 +6,13 @@ Makefile
 cmake_install.cmake
 compile_commands.json
 
-# Executables
-main_time_domain
+# Executables and binaries
+cable_solver
+example_rupture
+example_using_Network
+example_validation1
+*.so
+*.dylib
 
 # OS / IDE
 .DS_Store
@@ -16,11 +21,29 @@ main_time_domain
 .cmake/
 *.code-workspace
 
-# Dev logs
+# Dev logs / notes
 DEVLOG_*.md
 log.md
 log.txt
 note.md
-cable_solver
-example_rupture
-example_using_Network
+build.sh
+
+# lib/include junk
+lib/include/clean
+lib/include/draft.md
+lib/include/precompile.sh
+lib/include/test.cpp
+lib/include/fundamentaltest.cpp
+lib/include/fundamental.js
+lib/include/fundamental.wasm
+lib/include/pumpkin_simplified.obj
+lib/include/ultrasonic_sensor_data1.csv
+lib/include/trash_*.hpp
+
+# cable junk
+cable/clean
+
+# Python compiled
+*.pyc
+__pycache__/
+*.cpython-*.so
