@@ -84,7 +84,15 @@ cable/build_solver/cable_solver cable/gui/examples/catenary_500m.json /tmp/cable
 
 ### 張力指定の初期条件
 
-自然長が不明で張力のみ既知の場合（実橋など）:
+ケーブル解析では自然長（無応力長）$L_0$ が入力として必要だが，実橋の施工記録や FEM 解析結果からは**張力のみ既知で自然長が不明**なケースが多い．
+
+このような場合，`initial_condition: "tension"` を指定すると，ソルバが以下の手順で自然長を自動逆算する:
+
+1. 線形近似で $L_0$ を初期推定: $L_0 \approx L_\text{chord} / (1 + T_\text{avg}/EA)$
+2. その $L_0$ で equilibrium を完全に解き，端点張力 $T_\text{top}, T_\text{bot}$ を得る
+3. 目標張力との RMS 誤差を評価
+4. Secant method で $L_0$ を更新し，2–3 を繰り返す
+5. RMS 誤差が 0.01% 未満になったら収束
 
 ```json
 {
@@ -95,7 +103,13 @@ cable/build_solver/cable_solver cable/gui/examples/catenary_500m.json /tmp/cable
 }
 ```
 
-ソルバが secant method で「指定した端点張力を再現する自然長」を反復的に求める．
+- `tension_top`: 上端（塔側 / フェアリード側）の目標張力 [N]
+- `tension_bottom`: 下端（アンカー側 / 桁側）の目標張力 [N]
+- `cable_length`: コード長（端点間距離）．自然長ではなく参照値として使用
+
+`initial_condition` を省略するか `"length"` を指定した場合は，`cable_length` がそのまま自然長として使われる（従来動作）．
+
+> **Note**: top と bottom の張力差はケーブル自重で物理的に決まるため，1 つの自由度（$L_0$）で両方を完全に一致させることはできない．ソルバは両端張力の RMS 誤差を最小化する $L_0$ を求める．
 
 ### 動的モード
 
