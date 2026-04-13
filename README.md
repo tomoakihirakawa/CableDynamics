@@ -79,7 +79,7 @@ cd cable/gui
 > **Note**: GUI には X11 または Wayland のディスプレイサーバが必要．
 > WSL2 の場合は `export DISPLAY=:0` または WSLg（Windows 11）を利用．
 >
-> Linux での動作は未検証．問題があれば Issue で報告してください．
+> Linux での動作は未検証．問題がある場合は，エラーメッセージを添えてご連絡ください．
 
 ### Windows（MSYS2 / MinGW-w64）
 
@@ -114,7 +114,7 @@ python -m pycable
 > **Note**: Windows ネイティブ（Visual Studio）でのビルドは GNU 拡張 (`-std=gnu++23`) の非互換により非推奨．
 > MSYS2/MinGW-w64 経由で GCC を使うことを推奨．
 >
-> Windows での動作は未検証．問題があれば Issue で報告してください．
+> Windows での動作は未検証．問題がある場合は，エラーメッセージを添えてご連絡ください．
 
 ## 使い方
 
