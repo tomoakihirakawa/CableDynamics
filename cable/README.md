@@ -43,7 +43,7 @@
 | [build_solver/](build_solver/) | `cable_solver` バイナリのビルドツリー |
 | [gui/](gui/) | PySide6 + PyVista 製 GUI (`pycable` パッケージ) |
 | [gui/examples/mooring_3leg_catenary.json](gui/examples/mooring_3leg_catenary.json) | 公開用 3 本脚カテナリ係留サンプル（多重ライン形式） |
-| [examples/yuri_bridge/](examples/yuri_bridge/) | 単一主塔 2D 斜張橋 C01–C12 の入力 JSON と Excel 原データ（dev only、公開同期対象外） |
+| [gui/examples/yuri_bridge/](gui/examples/yuri_bridge/) | 単一主塔 2D 斜張橋 C01–C12 の入力 JSON（Excel 原データは非公開） |
 | [memo.md](memo.md) | ISO19901-7 係留諸元、橋梁ケーブル風応答への拡張検討メモ |
 | [references/](references/) | 文献資料 |
 
@@ -313,7 +313,7 @@ BEM の `settings.json` → `input_files` と同じパターン。
 | 橋梁ケーブル C01 | [gui/examples/bridge_C01.json](gui/examples/bridge_C01.json) | per-cable | 斜張橋 C01、body ラベル付き |
 | 3 本脚カテナリ係留 | [gui/examples/mooring_3leg_catenary.json](gui/examples/mooring_3leg_catenary.json) | 多重 | 120° 分散の 3 本脚 |
 | 端点 heave 振動 | [gui/examples/dynamic_heave.json](gui/examples/dynamic_heave.json) | per-cable | 動的モード、片端 sinusoidal |
-| 斜張橋 12 本一括 | [examples/yuri_bridge/settings.json](examples/yuri_bridge/settings.json) | settings | 12 本 per-cable + tension 初期条件（dev only） |
+| 斜張橋 12 本一括 | [gui/examples/yuri_bridge/settings.json](gui/examples/yuri_bridge/settings.json) | settings | 12 本 per-cable + tension 初期条件 |
 
 ## モデル方法
 
@@ -550,7 +550,7 @@ BEM 時間領域ソルバ ([bem/time_domain/main_time_domain.cpp](../bem/time_do
   なので、別途節点絶対速度に対する質量比例項 $\alpha \mathbf{M}$ を加える。
 - [x] **プリテンション指定モード**。`initial_condition: "tension"` + `tension_top` / `tension_bottom` で secant method 反復（2026-04-13）。
 
-### 橋梁ケーブル検証 (`examples/yuri_bridge/`)
+### 橋梁ケーブル検証 (`gui/examples/yuri_bridge/`)
 
 - [ ] C01–C12 をまとめて回すバッチスクリプトと、Excel の軸力参照値との比較
   レポート生成（`yuri_bridge_all.json` + 多重ラインモードで既に 1 コマンド
@@ -568,7 +568,7 @@ BEM 時間領域ソルバ ([bem/time_domain/main_time_domain.cpp](../bem/time_do
 
 ### 公開リポ反映
 
-- [ ] `examples/yuri_bridge/` の公開可否判断。現状は dev only。
+- [ ] `gui/examples/yuri_bridge/` の公開可否判断。現状は dev only。
 - [ ] [memo.md](memo.md) の橋梁風応答セクションを、dev 内検討に留めるか、
   英訳して公開するか決める。
 
