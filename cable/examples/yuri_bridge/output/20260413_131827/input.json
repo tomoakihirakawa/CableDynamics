@@ -1,0 +1,26 @@
+{
+  "point_a": [
+    -104.1,
+    0.0,
+    0.0
+  ],
+  "point_b": [
+    0.0,
+    0.0,
+    45.0
+  ],
+  "cable_length": 113.41,
+  "n_segments": 30,
+  "line_density": 63.2514,
+  "EA": 1530925000.0,
+  "damping": 0.5,
+  "diameter": 0.10129,
+  "gravity": 9.81,
+  "mode": "equilibrium",
+  "max_equilibrium_steps": 500000,
+  "equilibrium_tol": 0.01,
+  "snapshot_interval": 5000,
+  "initial_condition": "tension",
+  "tension_top": 1019997.8,
+  "tension_bottom": 986766.8
+}

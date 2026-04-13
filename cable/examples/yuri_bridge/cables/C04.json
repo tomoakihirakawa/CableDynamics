@@ -1,0 +1,24 @@
+{
+  "name": "C04",
+  "end_a_position": [
+    -61.512,
+    0.0,
+    0.0
+  ],
+  "end_a_body": "deck",
+  "end_b_position": [
+    0.0,
+    0.0,
+    31.8
+  ],
+  "end_b_body": "tower",
+  "cable_length": 69.246,
+  "n_points": 31,
+  "line_density": 63.2514,
+  "EA": 1530925000.0,
+  "damping": 0.5,
+  "diameter": 0.10129,
+  "initial_condition": "tension",
+  "tension_top": 2062263.243,
+  "tension_bottom": 2038796.752
+}

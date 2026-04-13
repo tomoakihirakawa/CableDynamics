@@ -1,0 +1,22 @@
+{
+  "input_files": [
+    "cables/C01.json",
+    "cables/C02.json",
+    "cables/C03.json",
+    "cables/C04.json",
+    "cables/C05.json",
+    "cables/C06.json",
+    "cables/C07.json",
+    "cables/C08.json",
+    "cables/C09.json",
+    "cables/C10.json",
+    "cables/C11.json",
+    "cables/C12.json"
+  ],
+  "output_directory": "./output",
+  "gravity": 9.81,
+  "mode": "equilibrium",
+  "max_equilibrium_steps": 500000,
+  "equilibrium_tol": 0.01,
+  "snapshot_interval": 5000
+}
