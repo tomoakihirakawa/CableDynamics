@@ -25,17 +25,40 @@ make -j$(nproc)                       # Linux
 
 ## Usage
 
+### C++ CLI
+
 ```bash
-./cable_solver path/to/cable_config.json
+./build/cable_solver input.json output_dir/
+```
+
+Two arguments are required: an input JSON file (see
+[`cable/gui/examples/`](cable/gui/examples/) for working samples) and an
+output directory where `result.json` and per-snapshot data are written.
+
+### Python GUI
+
+A PySide6 / PyVista GUI that drives the same `cable_solver` binary lives in
+[`cable/gui/`](cable/gui/). It exposes a parameter form, launches the solver,
+shows live convergence in 3D, and colors the final cable by tension. See
+[`cable/gui/README.md`](cable/gui/README.md) for setup and usage.
+
+```bash
+cd cable/gui
+./run.sh
 ```
 
 ## Directory Structure
 
 ```
-├── lib/                  # Shared library (mesh, geometry)
-│   ├── include/          # Header files
-│   └── src/              # Source files
-└── cable/                # Cable dynamics solver
+├── lib/                   # Shared library (mesh, geometry)
+│   ├── include/           # Header files
+│   └── src/               # Source files
+└── cable/                 # Cable dynamics solver
+    ├── cable_solver.cpp   # C++ entry point
+    └── gui/               # Python GUI wrapper (pycable) — optional
+        ├── pycable/
+        ├── examples/
+        └── tests/
 ```
 
 ## Related Packages

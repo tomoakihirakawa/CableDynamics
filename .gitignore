@@ -48,3 +48,4 @@ cable/clean
 *.pyc
 __pycache__/
 *.cpython-*.so
+.venv/
