@@ -24,6 +24,13 @@ from PySide6.QtWidgets import (
 from ..params import CableParams
 
 
+# Preset defaults — mirrors cable_solver.cpp::resolveFluidConfig.
+_FLUID_PRESETS = {
+    "water": {"density": 1000.0, "Cd": 2.5},
+    "air":   {"density": 1.225,  "Cd": 1.2},
+}
+
+
 def _make_double_spin(
     lo: float, hi: float, default: float, decimals: int, suffix: str = ""
 ) -> QDoubleSpinBox:
@@ -133,6 +140,87 @@ class SetupPanel(QWidget):
 
         layout.addWidget(adv)
 
+        # ----------------- Fluid & Wind (advanced) -----------------
+        fw = QGroupBox("Fluid & Wind (advanced)")
+        fw.setCheckable(True)
+        fw.setChecked(False)
+        fw_form = QFormLayout(fw)
+
+        self.cbo_fluid = QComboBox()
+        self.cbo_fluid.addItems(["water", "air"])
+        self.cbo_fluid.setCurrentText(defaults.fluid)
+        fw_form.addRow("Fluid preset", self.cbo_fluid)
+
+        fluid_preset = _FLUID_PRESETS[defaults.fluid]
+        self.spin_fluid_density = _make_double_spin(
+            0.01, 1e5,
+            defaults.fluid_density if defaults.fluid_density is not None else fluid_preset["density"],
+            4,
+        )
+        fw_form.addRow("Fluid density [kg/m³]", self.spin_fluid_density)
+
+        self.spin_drag_cd = _make_double_spin(
+            0.0, 100.0,
+            defaults.drag_Cd if defaults.drag_Cd is not None else fluid_preset["Cd"],
+            3,
+        )
+        fw_form.addRow("Drag Cd", self.spin_drag_cd)
+
+        self.cbo_wind = QComboBox()
+        self.cbo_wind.addItems(["none", "uniform", "AR1"])
+        self.cbo_wind.setCurrentText(defaults.wind_type)
+        fw_form.addRow("Wind type", self.cbo_wind)
+
+        self.spin_wind_ux = _make_double_spin(-100.0, 100.0, defaults.wind_U_mean[0], 3)
+        self.spin_wind_uy = _make_double_spin(-100.0, 100.0, defaults.wind_U_mean[1], 3)
+        self.spin_wind_uz = _make_double_spin(-100.0, 100.0, defaults.wind_U_mean[2], 3)
+        fw_form.addRow("Wind U_mean X [m/s]", self.spin_wind_ux)
+        fw_form.addRow("Wind U_mean Y [m/s]", self.spin_wind_uy)
+        fw_form.addRow("Wind U_mean Z [m/s]", self.spin_wind_uz)
+
+        self.spin_wind_ti = _make_double_spin(0.0, 2.0, defaults.wind_turbulence_intensity, 3)
+        fw_form.addRow("Turbulence intensity (AR1)", self.spin_wind_ti)
+
+        self.spin_wind_tl = _make_double_spin(0.01, 1000.0, defaults.wind_integral_time_scale, 3)
+        fw_form.addRow("Integral time scale [s] (AR1)", self.spin_wind_tl)
+
+        self.spin_wind_seed = QSpinBox()
+        self.spin_wind_seed.setRange(0, 2_000_000_000)
+        self.spin_wind_seed.setValue(defaults.wind_seed if defaults.wind_seed is not None else 0)
+        self.spin_wind_seed.setSpecialValueText("auto")
+        fw_form.addRow("Wind RNG seed (0=auto)", self.spin_wind_seed)
+
+        self.cbo_fluid.currentTextChanged.connect(self._on_fluid_preset_changed)
+        self.cbo_wind.currentTextChanged.connect(self._update_wind_row_enabled)
+        self._update_wind_row_enabled(defaults.wind_type)
+
+        layout.addWidget(fw)
+
+        # ----------------- Mode & dynamic parameters -----------------
+        mode_group = QGroupBox("Mode")
+        mode_form = QFormLayout(mode_group)
+
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItems(["equilibrium", "dynamic"])
+        self.combo_mode.setCurrentText(defaults.mode)
+        mode_form.addRow("Mode", self.combo_mode)
+
+        self.spin_dt = _make_double_spin(1e-6, 10.0, 0.005, 6, " s")
+        mode_form.addRow("dt", self.spin_dt)
+
+        self.spin_t_end = _make_double_spin(1e-3, 1e6, 5.0, 4, " s")
+        mode_form.addRow("t_end", self.spin_t_end)
+
+        self.spin_out_int = _make_double_spin(0.0, 1e6, 0.05, 6, " s")
+        self.spin_out_int.setSpecialValueText("auto")
+        mode_form.addRow("output_interval", self.spin_out_int)
+
+        self._dynamic_rows = (self.spin_dt, self.spin_t_end, self.spin_out_int)
+        self.combo_mode.currentTextChanged.connect(self._on_mode_changed)
+        self._on_mode_changed(defaults.mode)
+
+        layout.addWidget(mode_group)
+
         # ----------------- Solver -----------------
         sv = QGroupBox("Solver (advanced)")
         sv.setCheckable(True)
@@ -197,6 +285,13 @@ class SetupPanel(QWidget):
     # ------------------------------------------------------------------
 
     def collect_params(self) -> CableParams:
+        fluid = self.cbo_fluid.currentText()
+        preset = _FLUID_PRESETS[fluid]
+        fd_val = self.spin_fluid_density.value()
+        cd_val = self.spin_drag_cd.value()
+        fd_override = fd_val if abs(fd_val - preset["density"]) > 1e-9 else None
+        cd_override = cd_val if abs(cd_val - preset["Cd"]) > 1e-9 else None
+        seed_val = int(self.spin_wind_seed.value())
         return CableParams(
             point_a=(self.spin_ax.value(), self.spin_ay.value(), self.spin_az.value()),
             point_b=(self.spin_bx.value(), self.spin_by.value(), self.spin_bz.value()),
@@ -207,9 +302,25 @@ class SetupPanel(QWidget):
             damping=self.spin_damping.value(),
             diameter=self.spin_diameter.value(),
             gravity=self.spin_gravity.value(),
+            mode=self.combo_mode.currentText(),
+            dt=self.spin_dt.value(),
+            t_end=self.spin_t_end.value(),
+            output_interval=self.spin_out_int.value(),
             max_equilibrium_steps=int(self.spin_max_steps.value()),
             equilibrium_tol=self.spin_tol.value(),
             snapshot_interval=int(self.spin_snap.value()),
+            fluid=fluid,
+            fluid_density=fd_override,
+            drag_Cd=cd_override,
+            wind_type=self.cbo_wind.currentText(),
+            wind_U_mean=(
+                self.spin_wind_ux.value(),
+                self.spin_wind_uy.value(),
+                self.spin_wind_uz.value(),
+            ),
+            wind_turbulence_intensity=self.spin_wind_ti.value(),
+            wind_integral_time_scale=self.spin_wind_tl.value(),
+            wind_seed=seed_val if seed_val > 0 else None,
         )
 
     def set_params(self, params: CableParams) -> None:
@@ -227,9 +338,16 @@ class SetupPanel(QWidget):
             self.spin_density, self.spin_ea, self.spin_damping,
             self.spin_diameter, self.spin_gravity,
             self.spin_max_steps, self.spin_tol, self.spin_snap,
+            self.spin_dt, self.spin_t_end, self.spin_out_int,
+            self.spin_fluid_density, self.spin_drag_cd,
+            self.spin_wind_ux, self.spin_wind_uy, self.spin_wind_uz,
+            self.spin_wind_ti, self.spin_wind_tl, self.spin_wind_seed,
         )
+        all_combos = (self.cbo_fluid, self.cbo_wind, self.combo_mode)
         for s in all_spins:
             s.blockSignals(True)
+        for c in all_combos:
+            c.blockSignals(True)
         try:
             self.spin_ax.setValue(float(params.point_a[0]))
             self.spin_ay.setValue(float(params.point_a[1]))
@@ -247,9 +365,34 @@ class SetupPanel(QWidget):
             self.spin_max_steps.setValue(int(params.max_equilibrium_steps))
             self.spin_tol.setValue(float(params.equilibrium_tol))
             self.spin_snap.setValue(int(params.snapshot_interval))
+            # Mode & dynamic fields
+            self.combo_mode.setCurrentText(str(params.mode))
+            self.spin_dt.setValue(float(params.dt) if params.dt > 0 else 0.005)
+            self.spin_t_end.setValue(float(params.t_end) if params.t_end > 0 else 5.0)
+            self.spin_out_int.setValue(float(params.output_interval))
+            # Fluid & wind
+            self.cbo_fluid.setCurrentText(str(params.fluid))
+            preset = _FLUID_PRESETS[params.fluid]
+            self.spin_fluid_density.setValue(
+                float(params.fluid_density) if params.fluid_density is not None else preset["density"]
+            )
+            self.spin_drag_cd.setValue(
+                float(params.drag_Cd) if params.drag_Cd is not None else preset["Cd"]
+            )
+            self.cbo_wind.setCurrentText(str(params.wind_type))
+            self.spin_wind_ux.setValue(float(params.wind_U_mean[0]))
+            self.spin_wind_uy.setValue(float(params.wind_U_mean[1]))
+            self.spin_wind_uz.setValue(float(params.wind_U_mean[2]))
+            self.spin_wind_ti.setValue(float(params.wind_turbulence_intensity))
+            self.spin_wind_tl.setValue(float(params.wind_integral_time_scale))
+            self.spin_wind_seed.setValue(int(params.wind_seed) if params.wind_seed is not None else 0)
         finally:
             for s in all_spins:
                 s.blockSignals(False)
+            for c in all_combos:
+                c.blockSignals(False)
+        self._update_wind_row_enabled(params.wind_type)
+        self._on_mode_changed(str(params.mode))
 
         # Fire once after all fields are updated
         self.params_changed.emit(self.collect_params())
@@ -304,3 +447,23 @@ class SetupPanel(QWidget):
         self._tension_top_label.setEnabled(is_tension)
         self.spin_tension_bot.setEnabled(is_tension)
         self._tension_bot_label.setEnabled(is_tension)
+
+    def _on_fluid_preset_changed(self, preset_name: str) -> None:
+        preset = _FLUID_PRESETS.get(preset_name)
+        if not preset:
+            return
+        self.spin_fluid_density.setValue(float(preset["density"]))
+        self.spin_drag_cd.setValue(float(preset["Cd"]))
+
+    def _update_wind_row_enabled(self, wind_type: str) -> None:
+        any_wind = wind_type in ("uniform", "AR1")
+        ar1 = wind_type == "AR1"
+        for s in (self.spin_wind_ux, self.spin_wind_uy, self.spin_wind_uz):
+            s.setEnabled(any_wind)
+        for s in (self.spin_wind_ti, self.spin_wind_tl, self.spin_wind_seed):
+            s.setEnabled(ar1)
+
+    def _on_mode_changed(self, mode: str) -> None:
+        is_dynamic = (mode == "dynamic")
+        for s in self._dynamic_rows:
+            s.setEnabled(is_dynamic)

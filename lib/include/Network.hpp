@@ -606,10 +606,12 @@ public:
     return force;
   }
 
-  std::array<double, 3> getDragForce(const double Cd = 0.3) {
+  std::array<double, 3> getDragForce(const double Cd = 0.3,
+                                     const double rho = _WATER_DENSITY_,
+                                     const Tddd& U_fluid = {0., 0., 0.}) {
     std::array<double, 3> drag_force, relative_velocity, mean_v, fluid_velocity, normalized_relative_velocity, A2B;
     drag_force.fill(0);
-    fluid_velocity.fill(0);
+    fluid_velocity = U_fluid;
     double A;
     for (const auto& l : this->getLines()) {
       // mean_v = 0.5 * ((*l)(this)->RK_velocity_sub.getX() +
@@ -621,7 +623,7 @@ public:
       normalized_relative_velocity = Normalize(relative_velocity);
       A = l->diameter * Norm(A2B) * 0.5;                                                           //! half area
       A *= Norm(normalized_relative_velocity - Dot(normalized_relative_velocity, Normalize(A2B))); //! projected area
-      drag_force += 0.5 * _WATER_DENSITY_ * Dot(relative_velocity, relative_velocity) * Cd * A * normalized_relative_velocity;
+      drag_force += 0.5 * rho * Dot(relative_velocity, relative_velocity) * Cd * A * normalized_relative_velocity;
 
       if (!isFinite(A2B) || !isFinite(Normalize(A2B)) || !isFinite(normalized_relative_velocity) || !isFinite(relative_velocity) || !isFinite(drag_force)) {
         std::cout << "A2B = " << A2B << std::endl;

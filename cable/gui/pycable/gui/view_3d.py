@@ -76,7 +76,8 @@ class View3D(QWidget):
     # ------------------------------------------------------------------
 
     def show_endpoints(self, point_a, point_b) -> None:
-        """Red sphere at A, green sphere at B."""
+        """No-op: endpoint spheres are disabled (polyline endpoints are self-evident)."""
+        return
         for a in self._endpoint_actors:
             self._plotter.remove_actor(a, render=False)
         self._endpoint_actors = []
@@ -178,6 +179,146 @@ class View3D(QWidget):
     # Multi-cable API — accumulate results from a batch of cables
     # ------------------------------------------------------------------
 
+    def update_cable_fast(
+        self,
+        name: str,
+        positions: np.ndarray,
+        color: str,
+        scalars: np.ndarray | None = None,
+        clim: tuple[float, float] | None = None,
+        cmap: str = "coolwarm",
+    ) -> None:
+        """Fast in-place update of a cable's polyline for animation scrubbing.
+
+        When ``scalars`` is provided, the polyline is colored by that field
+        using ``cmap`` colormap instead of the solid ``color``. Recreates the
+        actor only when switching between solid-color and scalar modes, or
+        on first use; otherwise mutates mesh.points / mesh.point_data in place.
+        """
+        positions = np.ascontiguousarray(np.asarray(positions, float))
+        if positions.ndim != 2 or positions.shape[1] != 3 or positions.shape[0] < 2:
+            return
+
+        if not hasattr(self, "_fast_meshes"):
+            # name -> (poly, actor, mode, cmap) ; mode ∈ {"solid", "scalar"}
+            self._fast_meshes: dict[str, tuple] = {}
+
+        desired_mode = "scalar" if scalars is not None else "solid"
+        entry = self._fast_meshes.get(name)
+
+        # Recreate the actor if the rendering mode or colormap changed, or first call.
+        old_cmap = entry[3] if entry and len(entry) > 3 else None
+        need_recreate = (entry is None or entry[2] != desired_mode
+                         or (desired_mode == "scalar" and old_cmap != cmap))
+        if need_recreate:
+            if entry is not None:
+                try:
+                    self._plotter.remove_actor(entry[1], render=False)
+                except Exception:
+                    pass
+            poly = _chain_polyline(positions)
+            if desired_mode == "scalar":
+                poly.point_data["tension"] = np.asarray(scalars, float)[: poly.n_points]
+                actor = self._plotter.add_mesh(
+                    poly, scalars="tension", cmap=cmap,
+                    clim=clim, line_width=4, show_scalar_bar=False, render=False,
+                )
+            else:
+                actor = self._plotter.add_mesh(
+                    poly, color=color, line_width=4, render=False
+                )
+            self._fast_meshes[name] = (poly, actor, desired_mode, cmap)
+        else:
+            poly, _actor, _mode = entry
+            poly.points = positions
+            if desired_mode == "scalar":
+                poly.point_data["tension"] = np.asarray(scalars, float)[: poly.n_points]
+            poly.Modified()
+
+    def clear_fast_cables(self) -> None:
+        """Remove all fast-update polylines."""
+        if not hasattr(self, "_fast_meshes"):
+            return
+        for entry in self._fast_meshes.values():
+            # entry = (poly, actor, mode)
+            try:
+                self._plotter.remove_actor(entry[1], render=False)
+            except Exception:
+                pass
+        self._fast_meshes = {}
+
+    def set_static_cable(self, name: str, positions: np.ndarray) -> None:
+        """Store a reference 'static equilibrium' cable shape as a light-gray
+        background overlay. Call once per cable (typically the first frame
+        of the dynamic run)."""
+        positions = np.ascontiguousarray(np.asarray(positions, float))
+        if positions.ndim != 2 or positions.shape[1] != 3 or positions.shape[0] < 2:
+            return
+        if not hasattr(self, "_static_meshes"):
+            # name -> (positions, actor_or_None)
+            self._static_meshes: dict[str, tuple] = {}
+        if not hasattr(self, "_static_visible"):
+            self._static_visible = True
+        # Remove old actor for this name
+        entry = self._static_meshes.pop(name, None)
+        if entry is not None and entry[1] is not None:
+            try:
+                self._plotter.remove_actor(entry[1], render=False)
+            except Exception:
+                pass
+        # Create new actor only if currently visible
+        actor = None
+        if self._static_visible:
+            poly = _chain_polyline(positions)
+            actor = self._plotter.add_mesh(
+                poly, color="lightgray", line_width=2,
+                opacity=0.6, render=False,
+            )
+        self._static_meshes[name] = (positions.copy(), actor)
+
+    def clear_static_cables(self) -> None:
+        """Remove all static-equilibrium reference overlays."""
+        if not hasattr(self, "_static_meshes"):
+            return
+        for _pos, actor in self._static_meshes.values():
+            if actor is None:
+                continue
+            try:
+                self._plotter.remove_actor(actor, render=False)
+            except Exception:
+                pass
+        self._static_meshes = {}
+
+    def set_static_cables_visible(self, visible: bool) -> None:
+        """Show or hide the static-equilibrium reference overlays by actually
+        removing/re-creating the actors (the most reliable across VTK wrappers)."""
+        if not hasattr(self, "_static_meshes"):
+            return
+        self._static_visible = bool(visible)
+        updated: dict[str, tuple] = {}
+        for name, (positions, actor) in self._static_meshes.items():
+            # Remove current actor if any
+            if actor is not None:
+                try:
+                    self._plotter.remove_actor(actor, render=False)
+                except Exception:
+                    pass
+            if visible:
+                poly = _chain_polyline(positions)
+                new_actor = self._plotter.add_mesh(
+                    poly, color="lightgray", line_width=2,
+                    opacity=0.6, render=False,
+                )
+                updated[name] = (positions, new_actor)
+            else:
+                updated[name] = (positions, None)
+        self._static_meshes = updated
+        self._plotter.render()
+
+    def render_now(self) -> None:
+        """Trigger a single render (use after a batch of update_cable_fast)."""
+        self._plotter.render()
+
     def append_cable(
         self,
         name: str,
@@ -214,20 +355,13 @@ class View3D(QWidget):
                 self._plotter.remove_actor(a, render=False)
             del self._result_cables[name]
 
-        # Endpoints as small spheres
-        radius = _endpoint_radius(positions[0], positions[-1])
-        sphere_a = pv.Sphere(radius=radius, center=positions[0])
-        sphere_b = pv.Sphere(radius=radius, center=positions[-1])
-        actor_a = self._plotter.add_mesh(sphere_a, color=color, render=False)
-        actor_b = self._plotter.add_mesh(sphere_b, color=color, render=False)
-
-        # Curve as polyline
+        # Curve as polyline (endpoint spheres disabled per user preference)
         poly = _chain_polyline(positions)
         actor_curve = self._plotter.add_mesh(
             poly, color=color, line_width=4, render=False
         )
 
-        self._result_cables[name] = [actor_a, actor_b, actor_curve]
+        self._result_cables[name] = [actor_curve]
 
         self._refresh_bounds()
         self._plotter.render()
@@ -246,6 +380,9 @@ class View3D(QWidget):
         """
         self._clear_working_actors()
         self.clear_all_result_cables()
+        # Also remove fast-update animation cables so the tension display
+        # doesn't stack on top of the live scrubber polylines.
+        self.clear_fast_cables()
 
         if not cables:
             return
@@ -270,12 +407,6 @@ class View3D(QWidget):
             tensions = np.asarray(cable_data["tensions"], float)
             if positions.ndim != 2 or positions.shape[1] != 3 or len(positions) < 2:
                 continue
-
-            # Endpoints — small spheres
-            sphere_a = pv.Sphere(radius=endpoint_radius, center=positions[0])
-            sphere_b = pv.Sphere(radius=endpoint_radius, center=positions[-1])
-            actor_a = self._plotter.add_mesh(sphere_a, color="gray", render=False)
-            actor_b = self._plotter.add_mesh(sphere_b, color="gray", render=False)
 
             # Node markers (lumped mass positions) — small dots at each node
             node_cloud = pv.PolyData(positions)
@@ -306,7 +437,7 @@ class View3D(QWidget):
             )
             first = False
 
-            self._result_cables[name] = [actor_a, actor_b, actor_nodes, actor_curve]
+            self._result_cables[name] = [actor_nodes, actor_curve]
 
         self._refresh_bounds()
         self._plotter.render()

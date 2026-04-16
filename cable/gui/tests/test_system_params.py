@@ -210,7 +210,7 @@ def test_system_yuri_bridge_all_round_trip():
     """The actual yuri_bridge_all.json (12 cables) round-trips through
     LumpedCableSystemParams without losing any cable."""
     p = Path.home() / "Library" / "CloudStorage" / "Dropbox" / "code" / "cpp" \
-        / "cable" / "example_yuri_bridge" / "inputs" / "yuri_bridge_all.json"
+        / "cable" / "gui" / "examples" / "yuri_bridge" / "inputs" / "yuri_bridge_all.json"
     if not p.exists():
         pytest.skip(f"yuri_bridge_all.json not found at {p}")
     sys = LumpedCableSystemParams.read_json(p)

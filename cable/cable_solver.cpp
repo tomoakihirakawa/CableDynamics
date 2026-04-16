@@ -33,19 +33,26 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "LumpedCable.hpp"
+#include "WindField.hpp"
 #include "basic.hpp"
 #include "basic_IO.hpp"
 #include "basic_arithmetic_array_operations.hpp"
 #include "basic_vectors.hpp"
+#include "my_vtk.hpp"
+#include "vtkWriter.hpp"
 
 namespace fs = std::filesystem;
 
@@ -73,6 +80,58 @@ static std::vector<networkPoint*> getOrderedPoints(const LumpedCable* mooring) {
       current = next;
    }
    return ordered;
+}
+
+/* -------------------------------------------------------------------------- */
+/*                      ParaView (.vtp) writer for a cable                    */
+/* -------------------------------------------------------------------------- */
+
+// Zero-pad an integer to `width` digits (e.g. 42 → "0042").
+static std::string zfill_int(int value, int width = 5) {
+   std::ostringstream ss;
+   ss << std::setw(width) << std::setfill('0') << value;
+   return ss.str();
+}
+
+// Write a single-timestep .vtp file containing:
+//   - Points: ordered node positions along the cable
+//   - Lines:  (n-1) segments, one cell per segment
+//   - CellData "tension" [N]       (per-segment)
+//   - CellData "strain"  [-]       (per-segment; tension-only clamped to >=0)
+//   - PointData "velocity_mag" [m/s] (per-node)
+//
+// `points` is the ordered list returned by getOrderedPoints().
+// `seg_tension` and `seg_strain` must have size `points.size() - 1`.
+static void writeCableVTP(const fs::path& path,
+                          const std::vector<networkPoint*>& points,
+                          const std::vector<double>& seg_tension,
+                          const std::vector<double>& seg_strain) {
+   vtkPolygonWriter<networkPoint*> w;
+   w.reserve(points.size());
+
+   for (auto* p : points)
+      w.add(p);
+
+   // One polyline per segment so per-segment CellData maps 1:1 with cells.
+   for (size_t i = 0; i + 1 < points.size(); ++i)
+      w.addLine(std::vector<networkPoint*>{points[i], points[i + 1]});
+
+   w.addCellData("tension", seg_tension);
+   w.addCellData("strain", seg_strain);
+
+   std::unordered_map<networkPoint*, double> vel_mag;
+   vel_mag.reserve(points.size());
+   for (auto* p : points) {
+      double vm = std::sqrt(p->velocity[0] * p->velocity[0]
+                            + p->velocity[1] * p->velocity[1]
+                            + p->velocity[2] * p->velocity[2]);
+      vel_mag[p] = vm;
+   }
+   w.addPointData("velocity_mag", vel_mag);
+
+   std::ofstream ofs(path);
+   w.write(ofs);
+   ofs.close();
 }
 
 /* -------------------------------------------------------------------------- */
@@ -227,6 +286,229 @@ static void writeMultiResultJSON(const fs::path& filepath,
 }
 
 /* -------------------------------------------------------------------------- */
+/*                         PrescribedMotion                                    */
+/* -------------------------------------------------------------------------- */
+
+struct PrescribedMotion {
+   enum Kind { Fixed, Sinusoidal, Cantilever };
+   Kind kind = Fixed;
+   int dof = 2;           // 0=surge, 1=sway, 2=heave
+
+   // Mode components. For backward compat, modes[0] is always the primary.
+   // Sinusoidal uses modes[0] only (unless sinusoidal_multi injection added
+   // extra components). Cantilever may have modes[0]=mode1, modes[1]=mode2.
+   std::vector<double> amplitudes  = {0.0};
+   std::vector<double> freqs_hz    = {0.0};
+   std::vector<double> phases_rad  = {0.0};
+
+   // Cantilever-only geometry (shared across all modes).
+   Tddd fix_point = {0., 0., 0.};
+   Tddd axis_dir = {0., 0., 1.};
+   Tddd bend_dir = {1., 0., 0.};
+   double length = 1.0;
+
+   // Backward-compat scalar accessors (return modes[0]).
+   double amplitude()  const { return amplitudes.empty()  ? 0. : amplitudes[0]; }
+   double freq_hz_0()  const { return freqs_hz.empty()    ? 0. : freqs_hz[0]; }
+   double phase_rad_0() const { return phases_rad.empty() ? 0. : phases_rad[0]; }
+
+   Tddd velocity(double t) const {
+      if (kind == Fixed) return {0., 0., 0.};
+      double v = 0.;
+      for (size_t n = 0; n < amplitudes.size(); ++n) {
+         double w = 2. * M_PI * freqs_hz[n];
+         v += w * amplitudes[n] * std::cos(w * t + phases_rad[n]);
+      }
+      Tddd result = {0., 0., 0.};
+      if (dof == 0) std::get<0>(result) = v;
+      else if (dof == 1) std::get<1>(result) = v;
+      else std::get<2>(result) = v;
+      return result;
+   }
+
+   Tddd displacement(double t) const {
+      if (kind == Fixed) return {0., 0., 0.};
+      double d = 0.;
+      for (size_t n = 0; n < amplitudes.size(); ++n) {
+         double w = 2. * M_PI * freqs_hz[n];
+         d += amplitudes[n] * std::sin(w * t + phases_rad[n]);
+      }
+      Tddd result = {0., 0., 0.};
+      if (dof == 0) std::get<0>(result) = d;
+      else if (dof == 1) std::get<1>(result) = d;
+      else std::get<2>(result) = d;
+      return result;
+   }
+};
+
+static int parseDof(const std::string& s) {
+   if (s == "surge") return 0;
+   if (s == "sway") return 1;
+   return 2;  // heave
+}
+
+// Euler-Bernoulli clamped-free beam mode shape ψ_n(ξ), ξ ∈ [0, 1].
+// Characteristic equation: cos(βL) cosh(βL) + 1 = 0.
+// mode ∈ {1, 2, 3}. Normalized so ψ_n(1) = 1 (tip = tip amplitude).
+static double cantileverMode(int mode, double xi) {
+   static constexpr double BETAS[]  = {1.87510407, 4.69409113, 7.85475744};
+   static constexpr double SIGMAS[] = {0.73409551, 1.01846732, 0.99922450};
+   if (mode < 1 || mode > 3) return 0.0;
+   if (xi <= 0.0) return 0.0;
+   const double beta = BETAS[mode - 1];
+   const double sigma = SIGMAS[mode - 1];
+   auto psi_raw = [&](double s) {
+      double bs = beta * s;
+      return (std::cosh(bs) - std::cos(bs)) - sigma * (std::sinh(bs) - std::sin(bs));
+   };
+   // Pre-computed tip values ψ_raw(1) for normalization.
+   static const double TIP[3] = {
+      (std::cosh(BETAS[0]) - std::cos(BETAS[0])) - SIGMAS[0] * (std::sinh(BETAS[0]) - std::sin(BETAS[0])),
+      (std::cosh(BETAS[1]) - std::cos(BETAS[1])) - SIGMAS[1] * (std::sinh(BETAS[1]) - std::sin(BETAS[1])),
+      (std::cosh(BETAS[2]) - std::cos(BETAS[2])) - SIGMAS[2] * (std::sinh(BETAS[2]) - std::sin(BETAS[2])),
+   };
+   if (xi >= 1.0) return 1.0;
+   return psi_raw(xi) / TIP[mode - 1];
+}
+
+static double cantileverFirstMode(double xi) { return cantileverMode(1, xi); }
+
+// Map bend_dir to nearest cardinal DOF index (0=x, 1=y, 2=z).
+static int cardinalDof(const Tddd& v) {
+   double ax = std::abs(std::get<0>(v));
+   double ay = std::abs(std::get<1>(v));
+   double az = std::abs(std::get<2>(v));
+   if (ax >= ay && ax >= az) return 0;
+   if (ay >= az) return 1;
+   return 2;
+}
+
+// Compute the local sinusoidal amplitude(s) for a cantilever body at a given
+// attachment point. Returns one value per mode. Mode n uses cantileverMode(n, ξ).
+static std::vector<double> cantileverLocalAmplitudes(
+    const PrescribedMotion& m, const Tddd& attach_pos) {
+   if (m.kind != PrescribedMotion::Cantilever) return {};
+   Tddd r = attach_pos - m.fix_point;
+   double s = std::get<0>(r) * std::get<0>(m.axis_dir)
+            + std::get<1>(r) * std::get<1>(m.axis_dir)
+            + std::get<2>(r) * std::get<2>(m.axis_dir);
+   double xi = (m.length > 0.) ? (s / m.length) : 0.;
+   std::vector<double> out;
+   out.reserve(m.amplitudes.size());
+   for (size_t n = 0; n < m.amplitudes.size(); ++n)
+      out.push_back(m.amplitudes[n] * cantileverMode(static_cast<int>(n + 1), xi));
+   return out;
+}
+
+// Backward-compat: returns mode-1 amplitude only.
+static double cantileverLocalAmplitude(const PrescribedMotion& m,
+                                       const Tddd& attach_pos) {
+   auto amps = cantileverLocalAmplitudes(m, attach_pos);
+   return amps.empty() ? 0. : amps[0];
+}
+
+// Parse BEM-style `velocity` field from a body JSON.
+// Supported forms:
+//   "velocity": "fixed"                                   (string)
+//   "velocity": "floating"                                (treated as fixed for now)
+//   "velocity": ["sinusoidal"|"sin"|"cos", start_time,
+//                amplitude, period, axis_x, axis_y, axis_z]
+// Returns PrescribedMotion with kind=Sinusoidal if parseable; Fixed otherwise.
+// `motion_type_out` receives a human-readable label for logging.
+static PrescribedMotion parseBodyVelocity(const JSON& body_json,
+                                          std::string& motion_type_out) {
+   PrescribedMotion pm;
+   motion_type_out = "fixed";
+   if (!body_json.find("velocity")) return pm;
+   auto v = body_json.at("velocity");
+   if (v.empty()) return pm;
+
+   std::string mtype = v[0];
+   if (mtype == "fixed" || mtype == "floating") {
+      motion_type_out = mtype;
+      return pm;  // Fixed motion
+   }
+   if (mtype == "sinusoidal" || mtype == "sin" || mtype == "cos") {
+      if (v.size() < 7) {
+         std::cerr << "WARNING: velocity array for sinusoidal needs 7 elements "
+                   << "[type, start_time, amplitude, period, ax, ay, az], got "
+                   << v.size() << std::endl;
+         return pm;
+      }
+      double start_time = std::stod(v[1]);
+      double amplitude = std::stod(v[2]);
+      double period = std::stod(v[3]);
+      double ax = std::stod(v[4]);
+      double ay = std::stod(v[5]);
+      double az = std::stod(v[6]);
+      double absx = std::abs(ax), absy = std::abs(ay), absz = std::abs(az);
+      int dof = (absx >= absy && absx >= absz) ? 0 : (absy >= absz ? 1 : 2);
+      pm.kind = PrescribedMotion::Sinusoidal;
+      pm.dof = dof;
+      double fhz = (period > 0.) ? 1. / period : 0.;
+      pm.amplitudes  = {amplitude};
+      pm.freqs_hz    = {fhz};
+      pm.phases_rad  = {-2. * M_PI * fhz * start_time};
+      motion_type_out = "sinusoidal";
+      return pm;
+   }
+   if (mtype == "cantilever") {
+      // 14-element: mode 1 only (backward compat)
+      //   ["cantilever", start_time, tip_amp, period,
+      //    fix(3), axis(3), bend(3), length]
+      // 17-element: mode 1 + mode 2
+      //   [...14 as above..., tip_amp2, period2, phase2_rad]
+      if (v.size() < 14) {
+         std::cerr << "WARNING: velocity array for cantilever needs 14 or 17 elements, got "
+                   << v.size() << std::endl;
+         return pm;
+      }
+      double start_time = std::stod(v[1]);
+      double tip_amp = std::stod(v[2]);
+      double period = std::stod(v[3]);
+      Tddd fix = {std::stod(v[4]), std::stod(v[5]), std::stod(v[6])};
+      Tddd axis = {std::stod(v[7]), std::stod(v[8]), std::stod(v[9])};
+      Tddd bend = {std::stod(v[10]), std::stod(v[11]), std::stod(v[12])};
+      double beam_length = std::stod(v[13]);
+      auto normalize = [](Tddd& u) {
+         double n = std::sqrt(std::get<0>(u)*std::get<0>(u)
+                            + std::get<1>(u)*std::get<1>(u)
+                            + std::get<2>(u)*std::get<2>(u));
+         if (n > 0.) { std::get<0>(u)/=n; std::get<1>(u)/=n; std::get<2>(u)/=n; }
+      };
+      normalize(axis);
+      normalize(bend);
+      double freq1 = (period > 0.) ? 1. / period : 0.;
+      double phase1 = -2. * M_PI * freq1 * start_time;
+
+      pm.kind = PrescribedMotion::Cantilever;
+      pm.dof = cardinalDof(bend);
+      pm.amplitudes  = {tip_amp};
+      pm.freqs_hz    = {freq1};
+      pm.phases_rad  = {phase1};
+      pm.fix_point = fix;
+      pm.axis_dir = axis;
+      pm.bend_dir = bend;
+      pm.length = beam_length;
+
+      if (v.size() >= 17) {
+         double tip_amp2 = std::stod(v[14]);
+         double period2  = std::stod(v[15]);
+         double phase2   = std::stod(v[16]);
+         double freq2 = (period2 > 0.) ? 1. / period2 : 0.;
+         pm.amplitudes.push_back(tip_amp2);
+         pm.freqs_hz.push_back(freq2);
+         pm.phases_rad.push_back(phase2 - 2. * M_PI * freq2 * start_time);
+      }
+      motion_type_out = (pm.amplitudes.size() > 1) ? "cantilever(2mode)" : "cantilever";
+      return pm;
+   }
+   std::cerr << "WARNING: unsupported velocity type '" << mtype
+             << "' in body file; treating as fixed" << std::endl;
+   return pm;
+}
+
+/* -------------------------------------------------------------------------- */
 /*             Per-cable solver (new per-cable JSON format)                    */
 /* -------------------------------------------------------------------------- */
 
@@ -258,11 +540,81 @@ struct JSONReader {
       if (defaults && defaults->find(key)) return defaults->at(key)[0];
       return def;
    }
+   std::vector<double> getDoubleArray(const std::string& key) const {
+      std::vector<double> out;
+      const JSON* src = nullptr;
+      if (input.find(key)) src = &input;
+      else if (defaults && defaults->find(key)) src = defaults;
+      if (!src) return out;
+      for (const auto& s : src->at(key))
+         out.push_back(std::stod(s));
+      return out;
+   }
 };
+
+// Resolve fluid preset and wind configuration from a JSONReader.
+// Returns (rho, Cd, wind_fn) tuple. Wind is nullptr for "none" or missing.
+//
+// Settings.json flat-key schema:
+//   "fluid":                       "water" | "air" (default "water")
+//   "fluid_density":               [kg/m^3]  (optional, overrides preset)
+//   "drag_Cd":                     [-]       (optional, overrides preset)
+//   "wind_type":                   "none" | "uniform" | "AR1" (default "none")
+//   "wind_U_mean":                 [Ux, Uy, Uz] [m/s]
+//   "wind_turbulence_intensity":   sigma_u / |U_mean|  (AR1 only)
+//   "wind_integral_time_scale":    T_L [s]             (AR1 only)
+//   "wind_seed":                   RNG seed            (optional)
+struct FluidConfig {
+   double rho;
+   double Cd;
+   std::function<Tddd(const Tddd&, double)> wind_fn;
+};
+
+static FluidConfig resolveFluidConfig(const JSONReader& r) {
+   FluidConfig cfg;
+   std::string preset = r.getString("fluid", "water");
+   if (preset == "air") {
+      cfg.rho = 1.225;
+      cfg.Cd = 1.2;
+   } else {  // "water" or unknown -> water defaults (legacy behavior)
+      cfg.rho = _WATER_DENSITY_;
+      cfg.Cd = 2.5;
+   }
+   cfg.rho = r.getDouble("fluid_density", cfg.rho);
+   cfg.Cd = r.getDouble("drag_Cd", cfg.Cd);
+
+   std::string wtype = r.getString("wind_type", "none");
+   if (wtype == "uniform") {
+      Tddd U = r.getArray3("wind_U_mean", {0., 0., 0.});
+      cfg.wind_fn = WindField::makeUniform(U);
+   } else if (wtype == "AR1") {
+      Tddd U = r.getArray3("wind_U_mean", {0., 0., 0.});
+      double TI = r.getDouble("wind_turbulence_intensity", 0.15);
+      double TL = r.getDouble("wind_integral_time_scale", 5.0);
+      unsigned seed = static_cast<unsigned>(
+          r.getInt("wind_seed", static_cast<int>(std::time(nullptr))));
+      cfg.wind_fn = WindField::makeAR1(U, TI, TL, seed);
+   }
+   return cfg;
+}
+
+static void applyFluidConfig(LumpedCableSystem& sys, const FluidConfig& cfg) {
+   for (auto* c : sys.cables()) {
+      c->FluidDensity = cfg.rho;
+      c->DragForceCoefficient = cfg.Cd;
+      c->wind_field = cfg.wind_fn;
+   }
+   if (cfg.wind_fn)
+      std::cout << "[fluid] rho=" << cfg.rho << " Cd=" << cfg.Cd << " wind=ON" << std::endl;
+   else
+      std::cout << "[fluid] rho=" << cfg.rho << " Cd=" << cfg.Cd << " wind=OFF" << std::endl;
+}
 
 static int solvePerCable(const fs::path& input_path,
                          const fs::path& output_dir,
-                         const JSON* settings_defaults) {
+                         const JSON* settings_defaults,
+                         PVDWriter* master_pvd = nullptr,
+                         int master_part = 0) {
    JSON input(input_path.string());
    JSONReader r{input, settings_defaults};
 
@@ -410,53 +762,21 @@ static int solvePerCable(const fs::path& input_path,
    }
 
    // --- Parse endpoint motion ---
-   struct PrescribedMotion {
-      enum Kind { Fixed, Sinusoidal };
-      Kind kind = Fixed;
-      int dof = 2;           // 0=surge, 1=sway, 2=heave
-      double amplitude = 0;
-      double freq_hz = 0;
-      double phase_rad = 0;
-
-      Tddd velocity(double t) const {
-         if (kind == Fixed) return {0., 0., 0.};
-         double v = 2. * M_PI * freq_hz * amplitude
-                    * std::cos(2. * M_PI * freq_hz * t + phase_rad);
-         Tddd result = {0., 0., 0.};
-         if (dof == 0) std::get<0>(result) = v;
-         else if (dof == 1) std::get<1>(result) = v;
-         else std::get<2>(result) = v;
-         return result;
-      }
-
-      Tddd displacement(double t) const {
-         if (kind == Fixed) return {0., 0., 0.};
-         double d = amplitude * std::sin(2. * M_PI * freq_hz * t + phase_rad);
-         Tddd result = {0., 0., 0.};
-         if (dof == 0) std::get<0>(result) = d;
-         else if (dof == 1) std::get<1>(result) = d;
-         else std::get<2>(result) = d;
-         return result;
-      }
-   };
-
-   auto parseDof = [](const std::string& s) -> int {
-      if (s == "surge") return 0;
-      if (s == "sway") return 1;
-      if (s == "heave") return 2;
-      // roll/pitch/yaw → future (rotation not yet supported in prescribed motion)
-      return 2;  // default heave
-   };
-
    auto parseMotion = [&](const std::string& prefix) -> PrescribedMotion {
       PrescribedMotion m;
       std::string mt = r.getString(prefix + "_motion", "fixed");
       if (mt == "sinusoidal") {
          m.kind = PrescribedMotion::Sinusoidal;
          m.dof = parseDof(r.getString(prefix + "_motion_dof", "heave"));
-         m.amplitude = r.getDouble(prefix + "_motion_amplitude", 0.);
-         m.freq_hz = r.getDouble(prefix + "_motion_frequency", 0.);
-         m.phase_rad = r.getDouble(prefix + "_motion_phase", 0.);
+         m.amplitudes  = {r.getDouble(prefix + "_motion_amplitude", 0.)};
+         m.freqs_hz    = {r.getDouble(prefix + "_motion_frequency", 0.)};
+         m.phases_rad  = {r.getDouble(prefix + "_motion_phase", 0.)};
+      } else if (mt == "sinusoidal_multi") {
+         m.kind = PrescribedMotion::Sinusoidal;
+         m.dof = parseDof(r.getString(prefix + "_motion_dof", "heave"));
+         m.amplitudes  = r.getDoubleArray(prefix + "_motion_amplitudes");
+         m.freqs_hz    = r.getDoubleArray(prefix + "_motion_frequencies");
+         m.phases_rad  = r.getDoubleArray(prefix + "_motion_phases");
       }
       return m;
    };
@@ -495,6 +815,12 @@ static int solvePerCable(const fs::path& input_path,
    system.addCable(name, att_a, att_b,
                    natural_length, n_points,
                    CableProperties{line_density, EA, damping, diameter});
+
+   // Apply fluid/wind settings (water+no-wind by default, preserves legacy behavior).
+   // During solveEquilibrium() the LumpedCable RAII guards override these
+   // temporarily (water density, Cd=1000, no wind), so equilibrium converges
+   // identically regardless of target fluid.
+   applyFluidConfig(system, resolveFluidConfig(r));
 
    auto t_start = std::chrono::high_resolution_clock::now();
 
@@ -542,9 +868,19 @@ static int solvePerCable(const fs::path& input_path,
       std::cout << "Dynamic mode: dt=" << dt << " t_end=" << t_end_time
                 << " output_interval=" << output_interval << std::endl;
 
-      // First solve static equilibrium at initial positions
-      std::cout << "Initial equilibrium..." << std::endl;
-      system.solveEquilibrium(tol, max_steps, 0 /* no snapshots */);
+      // First solve static equilibrium at initial positions. We suppress the
+      // wind field here so the initial condition is the gravity-only
+      // catenary (fast pseudo-relaxation via Cd=1000 RAII in solveEquilibrium).
+      // The dynamic loop below re-applies the user's wind_field.
+      std::cout << "Initial equilibrium (wind suppressed for catenary IC)..." << std::endl;
+      {
+         std::vector<std::unique_ptr<LumpedCable::WindFieldGuard>> tmp_wind_guards;
+         tmp_wind_guards.reserve(system.cables().size());
+         for (auto* c : system.cables())
+            tmp_wind_guards.emplace_back(
+                std::make_unique<LumpedCable::WindFieldGuard>(c, nullptr));
+         system.solveEquilibrium(tol, max_steps, 0 /* no snapshots */);
+      }
       std::cout << "Initial equilibrium done." << std::endl;
 
       // Collect bodies that need RK driving
@@ -575,34 +911,121 @@ static int solvePerCable(const fs::path& input_path,
       double next_output_time = 0.;
       int step_count = 0;
 
-      // Helper to compute current tensions
-      auto computeTensions = [&]() -> std::tuple<double, double, double> {
+      // ParaView (.vtp + .pvd) output. Enabled by default; can be disabled
+      // via `output_paraview: false` in the input JSON. Per-cable .pvd lives
+      // at <output_dir>/<name>.pvd; .vtp files go under
+      // <output_dir>/paraview/<name>_<frame>.vtp.
+      //
+      // `paraview_interval` controls VTP output cadence in simulation
+      // seconds. It is independent of `output_interval` (which governs the
+      // JSON tension time series). Defaults to 10 × output_interval so a
+      // typical run produces ~10 VTP frames per cable — enough for a
+      // recognizable animation, small enough to avoid filesystem bloat.
+      bool output_paraview = (r.getString("output_paraview", "true") != "false");
+      double paraview_interval = r.getDouble("paraview_interval", 10.0 * output_interval);
+      if (paraview_interval <= 0.)
+         paraview_interval = 10.0 * output_interval;
+      double next_paraview_time = 0.;
+      std::optional<PVDWriter> per_cable_pvd;
+      if (output_paraview) {
+         fs::create_directories(output_dir / "paraview");
+         per_cable_pvd.emplace((output_dir / (name + ".pvd")).string());
+      }
+      int snap_index = 0;
+      // PVD flush cadence: rewrite the .pvd every N frames for crash
+      // resilience, plus once at simulation end. Per-frame flushes are
+      // O(N²) cumulative I/O and needless.
+      constexpr int PVD_FLUSH_EVERY = 25;
+
+      // Helper to compute current tensions and per-segment arrays. Returns
+      // (top, bottom, max) and fills out `seg_t` and `seg_eps` with the
+      // per-segment tension [N] and strain [-] (tension-only clamped so
+      // negative strains map to zero tension; strain itself is kept signed
+      // for diagnostics).
+      auto computeTensions = [&](std::vector<double>& seg_t,
+                                 std::vector<double>& seg_eps)
+          -> std::tuple<double, double, double> {
          auto points = getOrderedPoints(cable);
          int n = points.size();
          double nat_len = cable->natural_length();
          double stiffness_val = 0;
          for (auto l : cable->getLines()) { stiffness_val = l->stiffness; break; }
-         std::vector<double> seg_t(n - 1, 0.);
+         seg_t.assign(n > 1 ? n - 1 : 0, 0.);
+         seg_eps.assign(n > 1 ? n - 1 : 0, 0.);
          for (int i = 0; i < n - 1; ++i) {
             Tddd dv = points[i + 1]->X - points[i]->X;
             double dist = Norm(dv);
             double strain = (dist - nat_len) / nat_len;
+            seg_eps[i] = strain;
             if (strain > 0.) seg_t[i] = stiffness_val * strain;
          }
          double top = (n > 1) ? seg_t.back() : 0;
          double bot = (n > 1) ? seg_t.front() : 0;
-         double mx = *std::max_element(seg_t.begin(), seg_t.end());
+         double mx = (n > 1) ? *std::max_element(seg_t.begin(), seg_t.end()) : 0;
          return {top, bot, mx};
       };
 
+      // Write one ParaView frame: .vtp + PVD push (per-cable and master).
+      // The PVD files are flushed every PVD_FLUSH_EVERY frames; a final
+      // flush happens after the time loop (see below).
+      auto writeParaviewFrame = [&](double t_frame,
+                                    const std::vector<networkPoint*>& points,
+                                    const std::vector<double>& seg_t,
+                                    const std::vector<double>& seg_eps) {
+         if (!output_paraview) return;
+         fs::path vtp_rel = fs::path("paraview") / (name + "_" + zfill_int(snap_index) + ".vtp");
+         writeCableVTP(output_dir / vtp_rel, points, seg_t, seg_eps);
+         per_cable_pvd->push(vtp_rel.string(), t_frame);
+         if (master_pvd) {
+            // master_pvd is shared when solvePerCable is called concurrently
+            // from the settings-mode dynamic loop; serialize the append/flush.
+            _Pragma("omp critical(master_pvd)")
+            {
+               master_pvd->push(vtp_rel.string(), t_frame, master_part);
+            }
+         }
+         if (snap_index % PVD_FLUSH_EVERY == 0) {
+            per_cable_pvd->output();
+            if (master_pvd) {
+               _Pragma("omp critical(master_pvd)")
+               {
+                  master_pvd->output();
+               }
+            }
+         }
+         ++snap_index;
+      };
+
       // Record initial state
+      std::vector<double> seg_t_cur, seg_eps_cur;
       {
-         auto [top, bot, mx] = computeTensions();
+         auto [top, bot, mx] = computeTensions(seg_t_cur, seg_eps_cur);
          time_series.push_back(0.);
          top_tension_series.push_back(top);
          bot_tension_series.push_back(bot);
          max_tension_series.push_back(mx);
          next_output_time = output_interval;
+      }
+
+      // Emit a t=0 snapshot of the initial equilibrium state so playback
+      // starts cleanly from the static catenary.
+      if (snapshot_interval > 0) {
+         auto points = getOrderedPoints(cable);
+         std::cout << "SNAPSHOT {\"cable\":\"" << name << "\""
+                   << ",\"t\":0,\"iter\":-1"
+                   << ",\"positions\":[";
+         for (size_t k = 0; k < points.size(); ++k) {
+            auto X = points[k]->X;
+            std::cout << "[" << std::get<0>(X) << "," << std::get<1>(X)
+                      << "," << std::get<2>(X) << "]";
+            if (k + 1 < points.size()) std::cout << ",";
+         }
+         std::cout << "]}" << std::endl;
+      }
+      if (output_paraview) {
+         auto points = getOrderedPoints(cable);
+         writeParaviewFrame(0., points, seg_t_cur, seg_eps_cur);
+         next_paraview_time = paraview_interval;
       }
 
       // Dynamic time loop with CFL sub-stepping.
@@ -659,19 +1082,33 @@ static int solvePerCable(const fs::path& input_path,
 
          // Output at user dt intervals
          double t_now = t + dt;
+         bool did_output_step = false;
          if (t_now >= next_output_time - dt * 0.01) {
-            auto [top, bot, mx] = computeTensions();
+            auto [top, bot, mx] = computeTensions(seg_t_cur, seg_eps_cur);
             time_series.push_back(t_now);
             top_tension_series.push_back(top);
             bot_tension_series.push_back(bot);
             max_tension_series.push_back(mx);
             next_output_time += output_interval;
+            did_output_step = true;
          }
 
-         // SNAPSHOT
+         // ParaView frame at its own (coarser) cadence. Independent of the
+         // JSON time series so a 10-frame animation can coexist with a
+         // 100-sample tension curve.
+         if (output_paraview && t_now >= next_paraview_time - dt * 0.01) {
+            if (!did_output_step)
+               (void)computeTensions(seg_t_cur, seg_eps_cur);
+            auto points = getOrderedPoints(cable);
+            writeParaviewFrame(t_now, points, seg_t_cur, seg_eps_cur);
+            next_paraview_time += paraview_interval;
+         }
+
+         // SNAPSHOT (stdout, for GUI memory playback)
          if (snapshot_interval > 0 && step_count % snapshot_interval == 0) {
             auto points = getOrderedPoints(cable);
-            std::cout << "SNAPSHOT {\"t\":" << t_now << ",\"iter\":" << step_count
+            std::cout << "SNAPSHOT {\"cable\":\"" << name << "\""
+                      << ",\"t\":" << t_now << ",\"iter\":" << step_count
                       << ",\"positions\":[";
             for (size_t k = 0; k < points.size(); ++k) {
                auto X = points[k]->X;
@@ -681,12 +1118,21 @@ static int solvePerCable(const fs::path& input_path,
             }
             std::cout << "]}" << std::endl;
          }
+         (void)did_output_step;  // reserved for future use
       }
 
       auto t_end_dyn = std::chrono::high_resolution_clock::now();
       double elapsed_ms = std::chrono::duration<double, std::milli>(t_end_dyn - t_start).count();
       std::cout << "Dynamic simulation complete. Steps: " << step_count
                 << "  Elapsed: " << elapsed_ms << " ms" << std::endl;
+
+      // Final flush of the per-cable PVD so the last batch of frames is
+      // visible in ParaView even if PVD_FLUSH_EVERY didn't hit at the end.
+      if (output_paraview && per_cable_pvd) {
+         per_cable_pvd->output();
+         std::cout << "ParaView: " << snap_index << " frame(s) written "
+                   << "(interval=" << paraview_interval << "s)" << std::endl;
+      }
 
       // Write dynamic result JSON
       {
@@ -767,20 +1213,230 @@ int main(int argc, char* argv[]) {
    if (input.find("input_files")) {
       fs::path input_dir = input_path.parent_path();
       auto cable_files = input.at("input_files");
-      std::cout << "=== Cable Solver (settings mode, " << cable_files.size()
-                << " cable files) ===" << std::endl;
-      int failures = 0;
+
+      JSONReader sr{input, nullptr};
+      double gravity = sr.getDouble("gravity", 9.81);
+      std::string mode = sr.getString("mode", "equilibrium");
+      int max_steps = sr.getInt("max_equilibrium_steps", 500000);
+      double tol = sr.getDouble("equilibrium_tol", 0.01);
+      int snapshot_interval = sr.getInt("snapshot_interval", 10000);
+
+      _GRAVITY_ = gravity;
+      _GRAVITY3_ = {0., 0., -gravity};
+
+      // ---- Parse bodies section ----
+      struct BodyDef {
+         std::string name;
+         std::unique_ptr<Network> network;
+         PrescribedMotion motion;
+      };
+      std::map<std::string, std::shared_ptr<BodyDef>> bodies;
+
+      // Pre-scan input_files: discriminate between cable files and body files.
+      // A body file is a JSON with `type` field containing "RigidBody" (BEM
+      // convention). Each body file becomes a BodyDef in the `bodies` map.
+      // All other files are treated as cables.
+      std::vector<std::string> actual_cable_files;
       for (const auto& fname : cable_files) {
+         fs::path p = input_dir / fname;
+         if (!fs::exists(p)) {
+            // keep the missing file in cable list so the per-cable loop reports it
+            actual_cable_files.push_back(fname);
+            continue;
+         }
+         JSON j(p.string());
+         JSONReader jr{j, nullptr};
+         std::string type = jr.getString("type", "");
+         if (type.find("RigidBody") != std::string::npos) {
+            std::string bname = jr.getString("name", fs::path(fname).stem().string());
+            std::string motion_type;
+            PrescribedMotion pm = parseBodyVelocity(j, motion_type);
+            auto bd = std::make_shared<BodyDef>();
+            bd->name = bname;
+            bd->motion = pm;
+            bodies[bname] = bd;
+            std::cout << "Body: " << bname << "  motion=" << motion_type
+                      << "  (from " << fname << ")" << std::endl;
+         } else {
+            actual_cable_files.push_back(fname);
+         }
+      }
+      cable_files = actual_cable_files;
+
+      // ---- If no bodies defined or equilibrium: solve each cable independently ----
+      if (bodies.empty() || mode == "equilibrium") {
+         std::cout << "=== Cable Solver (settings mode, " << cable_files.size()
+                   << " cable files, equilibrium) ===" << std::endl;
+         int failures = 0;
+         // Parallel across independent cable files. Each solvePerCable creates
+         // its own LumpedCableSystem (private RK state, private output file)
+         // so they do not share any per-cable state. The only shared writes
+         // are the global _GRAVITY_ / _GRAVITY3_ scalars, which all cables
+         // set to the same value from settings.json — a benign race.
+         // stdout snapshot lines may interleave across threads; each line is
+         // self-contained JSON with a cable name so downstream consumers can
+         // demux. For clean logs set OMP_NUM_THREADS=1.
+         _Pragma("omp parallel for reduction(+:failures) schedule(dynamic)")
+         for (size_t idx = 0; idx < cable_files.size(); ++idx) {
+            const auto& fname = cable_files[idx];
+            fs::path cable_path = input_dir / fname;
+            if (!fs::exists(cable_path)) {
+               std::cerr << "ERROR: cable file not found: " << cable_path << std::endl;
+               failures++;
+               continue;
+            }
+            std::cout << "\n--- " << fname << " ---" << std::endl;
+            int ret = solvePerCable(cable_path, output_dir, &input);
+            if (ret != 0) failures++;
+         }
+         std::cout << "\n=== Settings mode complete: " << cable_files.size()
+                   << " cables, " << failures << " failures ===" << std::endl;
+         return failures > 0 ? 1 : 0;
+      }
+
+      // ---- Dynamic mode with bodies: BEM-pattern shared time loop ----
+      std::cout << "=== Cable Solver (settings mode, " << cable_files.size()
+                << " cables, dynamic with " << bodies.size() << " bodies) ===" << std::endl;
+
+      double dt = sr.getDouble("dt", 0.01);
+      double t_end_time = sr.getDouble("t_end", 1.0);
+      double output_interval_val = sr.getDouble("output_interval", dt);
+
+      // First pass: solve equilibrium for each cable independently to get
+      // initial state, then collect them into a shared system for dynamic.
+      // (Tension initial condition is handled inside solvePerCable.)
+
+      // For now, run equilibrium per cable, then dynamic per cable with body motion.
+      // Full multi-cable shared time loop is a future enhancement.
+      // Master PVD aggregates all cables into one ParaView file (one `part`
+      // per cable). This is the single file to open in ParaView.
+      PVDWriter master_pvd((output_dir / "cables.pvd").string());
+      int failures = 0;
+      // Parallelize across cables. master_pvd is shared — access is guarded
+      // by `omp critical(master_pvd)` inside solvePerCable (writeParaviewFrame).
+      // `cable_part` is derived from loop index so no counter race. stdout may
+      // interleave across threads; each line carries a cable name for demux.
+      _Pragma("omp parallel for reduction(+:failures) schedule(dynamic)")
+      for (size_t idx = 0; idx < cable_files.size(); ++idx) {
+         const auto& fname = cable_files[idx];
+         int cable_part = static_cast<int>(idx);
          fs::path cable_path = input_dir / fname;
          if (!fs::exists(cable_path)) {
             std::cerr << "ERROR: cable file not found: " << cable_path << std::endl;
             failures++;
             continue;
          }
-         std::cout << "\n--- " << fname << " ---" << std::endl;
-         int ret = solvePerCable(cable_path, output_dir, &input);
+
+         // Read the cable JSON to find body references and attach positions.
+         JSON cable_json(cable_path.string());
+         JSONReader cr{cable_json, &input};
+         std::string end_a_body_name = cr.getString("end_a_body", "");
+         std::string end_b_body_name = cr.getString("end_b_body", "");
+         Tddd pos_a = cr.getArray3("end_a_position", {0., 0., 0.});
+         Tddd pos_b = cr.getArray3("end_b_position", {0., 0., 0.});
+
+         // If a body is referenced, inject its motion into the cable JSON
+         // as end_X_motion keys so solvePerCable picks them up.
+         // This bridges the body-based design to the per-cable solver.
+         JSON augmented = cable_json;
+         auto setKey = [&](const std::string& k, const std::string& v) {
+            augmented.map_S_S[k] = std::vector<std::string>{v};
+         };
+         auto setKeyArray = [&](const std::string& k, const std::vector<double>& vals) {
+            std::vector<std::string> sv;
+            sv.reserve(vals.size());
+            for (double v : vals) sv.push_back(std::to_string(v));
+            augmented.map_S_S[k] = sv;
+         };
+
+         auto injectMotion = [&](const std::string& prefix,
+                                 const std::string& body_name,
+                                 const Tddd& attach_pos) {
+            if (body_name.empty()) return;
+            auto it = bodies.find(body_name);
+            if (it == bodies.end()) return;
+            auto& pm = it->second->motion;
+            std::string dof_str = (pm.dof == 0) ? "surge" : (pm.dof == 1) ? "sway" : "heave";
+
+            if (pm.kind == PrescribedMotion::Cantilever) {
+               auto local_amps = cantileverLocalAmplitudes(pm, attach_pos);
+               if (local_amps.size() <= 1) {
+                  // Single-mode: backward compat sinusoidal
+                  setKey(prefix + "_motion", "sinusoidal");
+                  setKey(prefix + "_motion_dof", dof_str);
+                  setKey(prefix + "_motion_amplitude", std::to_string(local_amps.empty() ? 0. : local_amps[0]));
+                  setKey(prefix + "_motion_frequency", std::to_string(pm.freq_hz_0()));
+                  setKey(prefix + "_motion_phase", std::to_string(pm.phase_rad_0()));
+               } else {
+                  // Multi-mode: emit sinusoidal_multi with array keys
+                  setKey(prefix + "_motion", "sinusoidal_multi");
+                  setKey(prefix + "_motion_dof", dof_str);
+                  setKeyArray(prefix + "_motion_amplitudes", local_amps);
+                  setKeyArray(prefix + "_motion_frequencies", pm.freqs_hz);
+                  setKeyArray(prefix + "_motion_phases", pm.phases_rad);
+               }
+            } else if (pm.kind == PrescribedMotion::Sinusoidal) {
+               setKey(prefix + "_motion", "sinusoidal");
+               setKey(prefix + "_motion_dof", dof_str);
+               setKey(prefix + "_motion_amplitude", std::to_string(pm.amplitude()));
+               setKey(prefix + "_motion_frequency", std::to_string(pm.freq_hz_0()));
+               setKey(prefix + "_motion_phase", std::to_string(pm.phase_rad_0()));
+            }
+         };
+         injectMotion("end_a", end_a_body_name, pos_a);
+         injectMotion("end_b", end_b_body_name, pos_b);
+
+         // Also inject dynamic mode keys
+         setKey("mode", "dynamic");
+         setKey("dt", std::to_string(dt));
+         setKey("t_end", std::to_string(t_end_time));
+         setKey("output_interval", std::to_string(output_interval_val));
+
+         // Write augmented JSON to temp file and solve
+         fs::path tmp_cable = output_dir / (fs::path(fname).stem().string() + "_input.json");
+         {
+            std::ofstream ofs(tmp_cable);
+            ofs << "{\n";
+            bool first = true;
+            for (auto& [k, v] : augmented()) {
+               if (!first) ofs << ",\n";
+               first = false;
+               if (v.size() == 1) {
+                  // Try to write as number if possible, otherwise as string
+                  bool is_num = true;
+                  try { std::stod(v[0]); } catch (...) { is_num = false; }
+                  if (is_num && k != "name" && k != "mode" && k != "initial_condition"
+                      && k.find("_body") == std::string::npos
+                      && k.find("_motion") == std::string::npos
+                      && k.find("_dof") == std::string::npos) {
+                     ofs << "  \"" << k << "\": " << v[0];
+                  } else {
+                     ofs << "  \"" << k << "\": \"" << v[0] << "\"";
+                  }
+               } else {
+                  ofs << "  \"" << k << "\": [";
+                  for (size_t i = 0; i < v.size(); ++i) {
+                     bool is_num = true;
+                     try { std::stod(v[i]); } catch (...) { is_num = false; }
+                     if (is_num) ofs << v[i]; else ofs << "\"" << v[i] << "\"";
+                     if (i + 1 < v.size()) ofs << ", ";
+                  }
+                  ofs << "]";
+               }
+            }
+            ofs << "\n}\n";
+         }
+
+         std::cout << "\n--- " << fname << " (body-driven dynamic) ---" << std::endl;
+         int ret = solvePerCable(tmp_cable, output_dir, &input, &master_pvd, cable_part);
          if (ret != 0) failures++;
       }
+
+      // Final flush of the master PVD (solvePerCable already flushes per
+      // frame, but write once more so the file reflects the final state).
+      master_pvd.output();
+      std::cout << "Master ParaView file: " << (output_dir / "cables.pvd") << std::endl;
+
       std::cout << "\n=== Settings mode complete: " << cable_files.size()
                 << " cables, " << failures << " failures ===" << std::endl;
       return failures > 0 ? 1 : 0;
@@ -909,6 +1565,13 @@ int main(int argc, char* argv[]) {
                       cable_length,
                       n_points,
                       CableProperties{line_density, EA, damping, diameter});
+   }
+
+   // Apply fluid/wind settings to all cables built above. Missing keys =>
+   // water density, Cd=2.5, no wind (legacy behavior).
+   {
+      JSONReader fluid_r{input, nullptr};
+      applyFluidConfig(system, resolveFluidConfig(fluid_r));
    }
 
    if (mode != "equilibrium") {

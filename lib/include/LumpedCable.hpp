@@ -156,6 +156,23 @@ class LumpedCable : public Network {
    // double DragForceCoefficient = 0.3;
    double DragForceCoefficient = 2.5;  // Palm2016はだいたいこのくらい
 
+   // Ambient fluid around the cable (water for mooring, air for bridge stays).
+   // Default = water density preserves legacy mooring behavior.
+   double FluidDensity = _WATER_DENSITY_;  // [kg/m^3]
+
+   // Wind / ambient-fluid velocity field U(X, t). nullptr = 0 (still fluid).
+   // Used by the 3 LumpedCable getDragForce call sites below.
+   std::function<Tddd(const Tddd&, double)> wind_field;
+
+   // Rayleigh mass-proportional damping [1/s]. Subtracts alpha_M * mass * v
+   // from the net force at each RK4 stage. Default 0 => no effect in dynamic
+   // simulations. solveEquilibrium()/setEquilibriumState() install an RAII
+   // guard that raises this to ~2 * fundamental frequency so pseudo-relaxation
+   // damps the low-frequency pendulum mode exponentially (quadratic drag
+   // alone gives only 1/t convergence near v=0). No physical effect outside
+   // the guarded region.
+   double alpha_M = 0.0;
+
    /* -------------------------------------------------------------------------- */
    /*         RAII guard that temporarily overrides DragForceCoefficient         */
    /* -------------------------------------------------------------------------- */
@@ -175,6 +192,49 @@ class LumpedCable : public Network {
       }
       DragForceCoefficientGuard(const DragForceCoefficientGuard&) = delete;
       DragForceCoefficientGuard& operator=(const DragForceCoefficientGuard&) = delete;
+   };
+
+   // Same pattern for FluidDensity — pseudo-relaxation should use water density
+   // regardless of target fluid so equilibrium convergence rate is fluid-agnostic.
+   struct FluidDensityGuard {
+      LumpedCable* cable;
+      double saved;
+      FluidDensityGuard(LumpedCable* c, double temporary_value)
+          : cable(c), saved(c->FluidDensity) {
+         cable->FluidDensity = temporary_value;
+      }
+      ~FluidDensityGuard() { cable->FluidDensity = saved; }
+      FluidDensityGuard(const FluidDensityGuard&) = delete;
+      FluidDensityGuard& operator=(const FluidDensityGuard&) = delete;
+   };
+
+   // Temporarily raise alpha_M (Rayleigh mass-proportional damping) during
+   // pseudo-relaxation. Critical-damping the fundamental pendulum mode cuts
+   // equilibrium step counts by 10-50x for typical bridge/mooring cables.
+   struct AlphaMGuard {
+      LumpedCable* cable;
+      double saved;
+      AlphaMGuard(LumpedCable* c, double temporary_value)
+          : cable(c), saved(c->alpha_M) {
+         cable->alpha_M = temporary_value;
+      }
+      ~AlphaMGuard() { cable->alpha_M = saved; }
+      AlphaMGuard(const AlphaMGuard&) = delete;
+      AlphaMGuard& operator=(const AlphaMGuard&) = delete;
+   };
+
+   // Suppress wind during equilibrium: gravity-only relaxation converges
+   // to a deterministic catenary; wind-on equilibrium is a user opt-in.
+   struct WindFieldGuard {
+      LumpedCable* cable;
+      std::function<Tddd(const Tddd&, double)> saved;
+      WindFieldGuard(LumpedCable* c, std::function<Tddd(const Tddd&, double)> temporary_value)
+          : cable(c), saved(std::move(c->wind_field)) {
+         cable->wind_field = std::move(temporary_value);
+      }
+      ~WindFieldGuard() { cable->wind_field = std::move(saved); }
+      WindFieldGuard(const WindFieldGuard&) = delete;
+      WindFieldGuard& operator=(const WindFieldGuard&) = delete;
    };
 
    /* -------------------------------------------------------------------------- */
@@ -206,7 +266,10 @@ class LumpedCable : public Network {
       std::array<double, 3> a;
       while (true) {
          for (auto& p : points) {
-            a = (p->getTension() + p->getDragForce(this->DragForceCoefficient) + p->getGravitationalForce()) / p->mass;
+            Tddd U_wind = this->wind_field ? this->wind_field(p->X, current_time) : Tddd{0., 0., 0.};
+            a = (p->getTension() + p->getDragForce(this->DragForceCoefficient, this->FluidDensity, U_wind) + p->getGravitationalForce()) / p->mass;
+            if (this->alpha_M != 0.)
+               a -= this->alpha_M * p->RK_velocity_sub.get_x();
             std::get<0>(p->acceleration) = std::get<0>(a);
             std::get<1>(p->acceleration) = std::get<1>(a);
             std::get<2>(p->acceleration) = std::get<2>(a);
@@ -274,7 +337,10 @@ class LumpedCable : public Network {
          while (1) {
             // std::cout << "RK : " << (*this->getPoints().begin())->RK_X_sub.current_step << std::endl;
             for (auto& p : points) {
-               a = (p->getTension() + p->getDragForce(this->DragForceCoefficient) + p->getGravitationalForce()) / p->mass;
+               Tddd U_wind = this->wind_field ? this->wind_field(p->X, current_time) : Tddd{0., 0., 0.};
+               a = (p->getTension() + p->getDragForce(this->DragForceCoefficient, this->FluidDensity, U_wind) + p->getGravitationalForce()) / p->mass;
+               if (this->alpha_M != 0.)
+                  a -= this->alpha_M * p->RK_velocity_sub.get_x();
                std::get<0>(p->acceleration) = std::get<0>(a);  // accelは変更しても構わない
                std::get<1>(p->acceleration) = std::get<1>(a);  // accelは変更しても構わない
                std::get<2>(p->acceleration) = std::get<2>(a);  // accelは変更しても構わない
@@ -333,7 +399,22 @@ class LumpedCable : public Network {
    bool setEquilibriumState(const std::function<void(networkPoint*)>& setBoundaryCondition,
                             const double tol = 1e-3,
                             const int max_iters = 100) {
-      DragForceCoefficientGuard guard(this, 1000.);
+      // Only apply pseudo-relaxation overrides when no wind is set — with
+      // wind, the steady drag shifts the physical fixed point and the
+      // overrides would push the cable to the wrong equilibrium.
+      std::unique_ptr<DragForceCoefficientGuard> cd_guard;
+      std::unique_ptr<FluidDensityGuard> rho_guard;
+      std::unique_ptr<AlphaMGuard> alpha_guard;
+      if (!this->wind_field) {
+         cd_guard = std::make_unique<DragForceCoefficientGuard>(this, 1000.);
+         rho_guard = std::make_unique<FluidDensityGuard>(this, _WATER_DENSITY_);
+         // Rayleigh mass-proportional damping ~ 2x fundamental pendulum
+         // frequency. Rough string estimate (T unknown here): use cable
+         // length alone as omega ~ pi * sqrt(g/L). Adequate for legacy path.
+         const double L = this->natural_length();
+         const double omega = (M_PI) * std::sqrt(std::max(_GRAVITY_ / L, 1e-12));
+         alpha_guard = std::make_unique<AlphaMGuard>(this, 2.0 * omega);
+      }
 
       auto points = ToVector(this->getPoints());
       double n = static_cast<double>(points.size());
@@ -587,11 +668,45 @@ class LumpedCableSystem {
                          SnapshotCallback snapshot_cb = {}) {
       if (_cables_view.empty()) return true;
 
-      // 1. RAII guards — temporarily crank Cd to 1000 on every cable.
-      std::vector<std::unique_ptr<LumpedCable::DragForceCoefficientGuard>> guards;
-      guards.reserve(_cables_view.size());
-      for (auto* c : _cables_view)
-         guards.emplace_back(std::make_unique<LumpedCable::DragForceCoefficientGuard>(c, 1000.0));
+      // 1. RAII guards for pseudo-relaxation. Two regimes:
+      //   (a) No wind on any cable: inflate Cd=1000 and use water density for
+      //       velocity-proportional damping so relaxation is fast and
+      //       fluid-agnostic. Equilibrium is drag-free (v=0 => drag=0) so
+      //       these overrides do not shift the final equilibrium.
+      //   (b) Any cable has wind_field != nullptr: the physical equilibrium
+      //       includes a steady drag term 0.5*rho*Cd*A*|U_wind|^2 that shifts
+      //       the fixed point. Applying the Cd/rho override here would move
+      //       the cable to the wrong fixed point. Keep user's settings
+      //       unchanged — convergence may be slower but correct.
+      bool any_wind = false;
+      for (auto* c : _cables_view) {
+         if (c->wind_field) { any_wind = true; break; }
+      }
+      std::vector<std::unique_ptr<LumpedCable::DragForceCoefficientGuard>> cd_guards;
+      std::vector<std::unique_ptr<LumpedCable::FluidDensityGuard>> rho_guards;
+      std::vector<std::unique_ptr<LumpedCable::AlphaMGuard>> alpha_guards;
+      if (!any_wind) {
+         cd_guards.reserve(_cables_view.size());
+         rho_guards.reserve(_cables_view.size());
+         alpha_guards.reserve(_cables_view.size());
+         for (size_t i = 0; i < _cables_view.size(); ++i) {
+            auto* c = _cables_view[i];
+            cd_guards.emplace_back(std::make_unique<LumpedCable::DragForceCoefficientGuard>(c, 1000.0));
+            rho_guards.emplace_back(std::make_unique<LumpedCable::FluidDensityGuard>(c, _WATER_DENSITY_));
+            // Rayleigh alpha_M: critical-damp the SLOWEST mode, which
+            // dominates convergence time. For a suspended cable, this is
+            // typically the pendulum/sway mode omega_p ~ sqrt(g/L) (not the
+            // stretched-string fundamental omega_s = pi/L * sqrt(T/mu), which
+            // is usually much higher). Over-damping omega_p with large
+            // alpha_M would slow convergence, not speed it up. Higher modes
+            // remain under-damped here but are damped fast by the inflated
+            // quadratic drag (Cd=1000).
+            const double L = c->natural_length();
+            const double omega_p = std::sqrt(std::max(_GRAVITY_ / L, 1e-12));
+            const double alpha = 2.0 * omega_p;  // ~critical for pendulum mode
+            alpha_guards.emplace_back(std::make_unique<LumpedCable::AlphaMGuard>(c, alpha));
+         }
+      }
 
       // 2. Per-cable CFL-based dt (NOT shared — each cable uses its own
       //    native dt = natural_length / wave_speed at CFL=1.0). Sharing a
@@ -652,9 +767,14 @@ class LumpedCableSystem {
             // 4 RK4 stages
             while (true) {
                for (auto& p : ordered) {
+                  // During equilibrium wind_field is RAII-guarded to nullptr,
+                  // so U_wind is always zero here. Kept in the call for symmetry.
+                  Tddd U_wind = cable->wind_field ? cable->wind_field(p->X, 0.) : Tddd{0., 0., 0.};
                   auto a = (p->getTension()
-                            + p->getDragForce(cable->DragForceCoefficient)
+                            + p->getDragForce(cable->DragForceCoefficient, cable->FluidDensity, U_wind)
                             + p->getGravitationalForce()) / p->mass;
+                  if (cable->alpha_M != 0.)
+                     a -= cable->alpha_M * p->RK_velocity_sub.get_x();
                   std::get<0>(p->acceleration) = std::get<0>(a);
                   std::get<1>(p->acceleration) = std::get<1>(a);
                   std::get<2>(p->acceleration) = std::get<2>(a);

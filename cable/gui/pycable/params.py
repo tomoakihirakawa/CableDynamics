@@ -31,6 +31,44 @@ from typing import Any, Iterable, Tuple
 Vec3 = Tuple[float, float, float]
 
 
+# ---------------------------------------------------------------------------
+# Fluid & Wind helpers (schema mirrors cable_solver.cpp::resolveFluidConfig).
+# See cable_common/params.py for the canonical documentation.
+# ---------------------------------------------------------------------------
+
+def _fluid_wind_to_dict(p: Any) -> dict[str, Any]:
+    d: dict[str, Any] = {}
+    if p.fluid != "water":
+        d["fluid"] = p.fluid
+    if p.fluid_density is not None:
+        d["fluid_density"] = float(p.fluid_density)
+    if p.drag_Cd is not None:
+        d["drag_Cd"] = float(p.drag_Cd)
+    if p.wind_type != "none":
+        d["wind_type"] = p.wind_type
+        d["wind_U_mean"] = list(p.wind_U_mean)
+        if p.wind_type == "AR1":
+            d["wind_turbulence_intensity"] = float(p.wind_turbulence_intensity)
+            d["wind_integral_time_scale"] = float(p.wind_integral_time_scale)
+            if p.wind_seed is not None:
+                d["wind_seed"] = int(p.wind_seed)
+    return d
+
+
+def _fluid_wind_from_dict(d: dict[str, Any], target: Any) -> None:
+    target.fluid = str(d.get("fluid", "water"))
+    target.fluid_density = (
+        float(d["fluid_density"]) if "fluid_density" in d else None
+    )
+    target.drag_Cd = float(d["drag_Cd"]) if "drag_Cd" in d else None
+    target.wind_type = str(d.get("wind_type", "none"))
+    wu = d.get("wind_U_mean", [0.0, 0.0, 0.0])
+    target.wind_U_mean = (float(wu[0]), float(wu[1]), float(wu[2]))
+    target.wind_turbulence_intensity = float(d.get("wind_turbulence_intensity", 0.15))
+    target.wind_integral_time_scale = float(d.get("wind_integral_time_scale", 5.0))
+    target.wind_seed = int(d["wind_seed"]) if "wind_seed" in d else None
+
+
 @dataclass
 class CableParams:
     """Parameters for a single cable_solver equilibrium run."""
@@ -54,6 +92,21 @@ class CableParams:
     equilibrium_tol: float = 0.01
     snapshot_interval: int = 10_000
 
+    # --- Dynamic mode ---
+    dt: float = 0.005
+    t_end: float = 5.0
+    output_interval: float = 0.0   # 0 = auto (use dt)
+
+    # --- Fluid & Wind (system-wide, applied to all cables) ---
+    fluid: str = "water"
+    fluid_density: float | None = None
+    drag_Cd: float | None = None
+    wind_type: str = "none"
+    wind_U_mean: Vec3 = (0.0, 0.0, 0.0)
+    wind_turbulence_intensity: float = 0.15
+    wind_integral_time_scale: float = 5.0
+    wind_seed: int | None = None
+
     # ------------------------------------------------------------------
     # Serialization
     # ------------------------------------------------------------------
@@ -65,7 +118,7 @@ class CableParams:
         parseJSON walks this in string form internally, but on-disk the
         file is human-readable standard JSON.
         """
-        return {
+        d = {
             "point_a": [float(x) for x in self.point_a],
             "point_b": [float(x) for x in self.point_b],
             "cable_length": float(self.cable_length),
@@ -80,12 +133,19 @@ class CableParams:
             "equilibrium_tol": float(self.equilibrium_tol),
             "snapshot_interval": int(self.snapshot_interval),
         }
+        if self.mode == "dynamic":
+            d["dt"] = float(self.dt)
+            d["t_end"] = float(self.t_end)
+            if self.output_interval > 0:
+                d["output_interval"] = float(self.output_interval)
+        d.update(_fluid_wind_to_dict(self))
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "CableParams":
         """Build CableParams from a dict, filling missing keys with defaults."""
         defaults = cls()
-        return cls(
+        obj = cls(
             point_a=tuple(d.get("point_a", defaults.point_a)),
             point_b=tuple(d.get("point_b", defaults.point_b)),
             cable_length=float(d.get("cable_length", defaults.cable_length)),
@@ -101,7 +161,12 @@ class CableParams:
             ),
             equilibrium_tol=float(d.get("equilibrium_tol", defaults.equilibrium_tol)),
             snapshot_interval=int(d.get("snapshot_interval", defaults.snapshot_interval)),
+            dt=float(d.get("dt", defaults.dt)),
+            t_end=float(d.get("t_end", defaults.t_end)),
+            output_interval=float(d.get("output_interval", defaults.output_interval)),
         )
+        _fluid_wind_from_dict(d, obj)
+        return obj
 
     def write_json(self, path: Path | str) -> None:
         """Write the params as a cable_solver-compatible input.json."""
@@ -249,6 +314,21 @@ class LumpedCableSystemParams:
     equilibrium_tol: float = 0.01
     snapshot_interval: int = 10_000
 
+    # Dynamic mode
+    dt: float = 0.005
+    t_end: float = 5.0
+    output_interval: float = 0.0  # 0 = auto
+
+    # Fluid & Wind (system-wide, applied to all cables by cable_solver.cpp)
+    fluid: str = "water"
+    fluid_density: float | None = None
+    drag_Cd: float | None = None
+    wind_type: str = "none"
+    wind_U_mean: Vec3 = (0.0, 0.0, 0.0)
+    wind_turbulence_intensity: float = 0.15
+    wind_integral_time_scale: float = 5.0
+    wind_seed: int | None = None
+
     # ------------------------------------------------------------------
     # Construction helpers
     # ------------------------------------------------------------------
@@ -264,6 +344,17 @@ class LumpedCableSystemParams:
             max_equilibrium_steps=int(params.max_equilibrium_steps),
             equilibrium_tol=float(params.equilibrium_tol),
             snapshot_interval=int(params.snapshot_interval),
+            dt=float(params.dt),
+            t_end=float(params.t_end),
+            output_interval=float(params.output_interval),
+            fluid=params.fluid,
+            fluid_density=params.fluid_density,
+            drag_Cd=params.drag_Cd,
+            wind_type=params.wind_type,
+            wind_U_mean=params.wind_U_mean,
+            wind_turbulence_intensity=params.wind_turbulence_intensity,
+            wind_integral_time_scale=params.wind_integral_time_scale,
+            wind_seed=params.wind_seed,
         )
 
     def is_single_legacy(self) -> bool:
@@ -283,23 +374,37 @@ class LumpedCableSystemParams:
         - Otherwise: multi-line ``mooring_<name>`` schema
         """
         if not self.cables:
-            return {
+            d = {
                 "gravity": float(self.gravity),
                 "mode": str(self.mode),
                 "max_equilibrium_steps": int(self.max_equilibrium_steps),
                 "equilibrium_tol": float(self.equilibrium_tol),
                 "snapshot_interval": int(self.snapshot_interval),
             }
+            d.update(_fluid_wind_to_dict(self))
+            return d
 
         if self.is_single_legacy():
             # Legacy single-line schema (matches CableParams.to_dict()).
-            return self.cables[0].to_cable_params(
+            cp = self.cables[0].to_cable_params(
                 gravity=self.gravity,
                 mode=self.mode,
                 max_equilibrium_steps=self.max_equilibrium_steps,
                 equilibrium_tol=self.equilibrium_tol,
                 snapshot_interval=self.snapshot_interval,
-            ).to_dict()
+            )
+            cp.dt = self.dt
+            cp.t_end = self.t_end
+            cp.output_interval = self.output_interval
+            cp.fluid = self.fluid
+            cp.fluid_density = self.fluid_density
+            cp.drag_Cd = self.drag_Cd
+            cp.wind_type = self.wind_type
+            cp.wind_U_mean = self.wind_U_mean
+            cp.wind_turbulence_intensity = self.wind_turbulence_intensity
+            cp.wind_integral_time_scale = self.wind_integral_time_scale
+            cp.wind_seed = self.wind_seed
+            return cp.to_dict()
 
         # Multi-line BEM-compatible schema.
         d: dict[str, Any] = {}
@@ -310,6 +415,12 @@ class LumpedCableSystemParams:
         d["max_equilibrium_steps"] = int(self.max_equilibrium_steps)
         d["equilibrium_tol"] = float(self.equilibrium_tol)
         d["snapshot_interval"] = int(self.snapshot_interval)
+        if self.mode == "dynamic":
+            d["dt"] = float(self.dt)
+            d["t_end"] = float(self.t_end)
+            if self.output_interval > 0:
+                d["output_interval"] = float(self.output_interval)
+        d.update(_fluid_wind_to_dict(self))
         return d
 
     @classmethod
@@ -337,14 +448,19 @@ class LumpedCableSystemParams:
                 damping=pc.damping,
                 diameter=pc.diameter,
             )
-            return cls(
+            obj = cls(
                 cables=[spec],
                 gravity=pc.gravity,
                 mode=pc.mode,
                 max_equilibrium_steps=pc.max_equilibrium_steps,
                 equilibrium_tol=pc.equilibrium_tol,
                 snapshot_interval=pc.snapshot_interval,
+                dt=pc.dt,
+                t_end=pc.t_end,
+                output_interval=pc.output_interval,
             )
+            _fluid_wind_from_dict(d, obj)
+            return obj
 
         # --- Multi-line format ---
         multi_keys: list[tuple[str, list[Any]]] = []
@@ -356,18 +472,26 @@ class LumpedCableSystemParams:
 
         if multi_keys:
             cables = [CableSpec.from_flat_array(v) for _, v in multi_keys]
-            return cls(
+            obj = cls(
                 cables=cables,
                 gravity=float(d.get("gravity", defaults.gravity)),
                 mode=str(d.get("mode", defaults.mode)),
                 max_equilibrium_steps=int(d.get("max_equilibrium_steps", defaults.max_equilibrium_steps)),
                 equilibrium_tol=float(d.get("equilibrium_tol", defaults.equilibrium_tol)),
                 snapshot_interval=int(d.get("snapshot_interval", defaults.snapshot_interval)),
+                dt=float(d.get("dt", defaults.dt)),
+                t_end=float(d.get("t_end", defaults.t_end)),
+                output_interval=float(d.get("output_interval", defaults.output_interval)),
             )
+            _fluid_wind_from_dict(d, obj)
+            return obj
 
         # --- Legacy single-line format ---
         legacy = CableParams.from_dict(d)
-        return cls.from_cable_params(legacy)
+        return cls.from_cable_params(
+            legacy,
+            name=str(d.get("name", DEFAULT_SINGLE_CABLE_NAME)),
+        )
 
     def write_json(self, path: Path | str) -> None:
         path = Path(path)
@@ -395,17 +519,28 @@ class LumpedCableSystemParams:
             all_cables: list[CableSpec] = []
             for fname in d["input_files"]:
                 cable_path = input_dir / fname
+                # Skip body files (BEM convention: type contains "RigidBody")
+                if cable_path.exists():
+                    with cable_path.open() as f_body:
+                        sub_d = json.load(f_body)
+                    if "RigidBody" in str(sub_d.get("type", "")):
+                        continue
                 sub = cls.read_json(cable_path)
                 all_cables.extend(sub.cables)
             defaults = cls()
-            return cls(
+            obj = cls(
                 cables=all_cables,
                 gravity=float(d.get("gravity", defaults.gravity)),
                 mode=str(d.get("mode", defaults.mode)),
                 max_equilibrium_steps=int(d.get("max_equilibrium_steps", defaults.max_equilibrium_steps)),
                 equilibrium_tol=float(d.get("equilibrium_tol", defaults.equilibrium_tol)),
                 snapshot_interval=int(d.get("snapshot_interval", defaults.snapshot_interval)),
+                dt=float(d.get("dt", defaults.dt)),
+                t_end=float(d.get("t_end", defaults.t_end)),
+                output_interval=float(d.get("output_interval", defaults.output_interval)),
             )
+            _fluid_wind_from_dict(d, obj)
+            return obj
 
         return cls.from_dict(d)
 
@@ -473,6 +608,16 @@ class PerCableParams:
     t_end: float = 0.0
     output_interval: float = 0.0
 
+    # --- Fluid & Wind (system-wide) ---
+    fluid: str = "water"
+    fluid_density: float | None = None
+    drag_Cd: float | None = None
+    wind_type: str = "none"
+    wind_U_mean: Vec3 = (0.0, 0.0, 0.0)
+    wind_turbulence_intensity: float = 0.15
+    wind_integral_time_scale: float = 5.0
+    wind_seed: int | None = None
+
     # ------------------------------------------------------------------
     # Serialization
     # ------------------------------------------------------------------
@@ -526,6 +671,7 @@ class PerCableParams:
             d["t_end"] = self.t_end
             if self.output_interval > 0:
                 d["output_interval"] = self.output_interval
+        d.update(_fluid_wind_to_dict(self))
         return d
 
     @classmethod
@@ -537,7 +683,7 @@ class PerCableParams:
                 return (float(v[0]), float(v[1]), float(v[2]))
             return default
 
-        return cls(
+        obj = cls(
             name=str(d.get("name", "cable")),
             end_a_position=_vec3("end_a_position", (0, 0, 0)),
             end_b_position=_vec3("end_b_position", (0, 0, 0)),
@@ -572,6 +718,8 @@ class PerCableParams:
             t_end=float(d.get("t_end", 0)),
             output_interval=float(d.get("output_interval", 0)),
         )
+        _fluid_wind_from_dict(d, obj)
+        return obj
 
     def write_json(self, path: Path | str) -> None:
         path = Path(path)
@@ -607,6 +755,17 @@ class PerCableParams:
             max_equilibrium_steps=p.max_equilibrium_steps,
             equilibrium_tol=p.equilibrium_tol,
             snapshot_interval=p.snapshot_interval,
+            dt=p.dt,
+            t_end=p.t_end,
+            output_interval=p.output_interval,
+            fluid=p.fluid,
+            fluid_density=p.fluid_density,
+            drag_Cd=p.drag_Cd,
+            wind_type=p.wind_type,
+            wind_U_mean=p.wind_U_mean,
+            wind_turbulence_intensity=p.wind_turbulence_intensity,
+            wind_integral_time_scale=p.wind_integral_time_scale,
+            wind_seed=p.wind_seed,
         )
 
     def to_cable_params(self) -> "CableParams":
@@ -625,6 +784,17 @@ class PerCableParams:
             max_equilibrium_steps=self.max_equilibrium_steps,
             equilibrium_tol=self.equilibrium_tol,
             snapshot_interval=self.snapshot_interval,
+            dt=self.dt,
+            t_end=self.t_end,
+            output_interval=self.output_interval,
+            fluid=self.fluid,
+            fluid_density=self.fluid_density,
+            drag_Cd=self.drag_Cd,
+            wind_type=self.wind_type,
+            wind_U_mean=self.wind_U_mean,
+            wind_turbulence_intensity=self.wind_turbulence_intensity,
+            wind_integral_time_scale=self.wind_integral_time_scale,
+            wind_seed=self.wind_seed,
         )
 
     @classmethod

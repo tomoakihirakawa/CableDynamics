@@ -27,10 +27,10 @@ def solver_path() -> Path:
 
 
 def test_cable_solver_runs_on_catenary_example(solver_path: Path, tmp_path: Path):
-    """Run the binary on examples/catenary_500m.json and inspect result.json."""
+    """Run the binary on examples/synthetic/catenary_500m.json and inspect result.json."""
     # tests/test_integration.py -> parents[1] = gui/, so examples/ is right next door.
     gui_dir = Path(__file__).resolve().parents[1]
-    example = gui_dir / "examples" / "catenary_500m.json"
+    example = gui_dir / "examples" / "synthetic" / "catenary_500m.json"
     assert example.is_file(), f"Example input missing: {example}"
 
     out_dir = tmp_path / "run_out"
@@ -82,7 +82,12 @@ def test_cable_solver_runs_on_catenary_example(solver_path: Path, tmp_path: Path
 
 def test_cable_solver_stdout_emits_snapshots(solver_path: Path, tmp_path: Path):
     """The SNAPSHOT contract the GUI relies on must be intact."""
-    example = Path(__file__).resolve().parents[1] / "examples" / "bridge_cable_small.json"
+    example = (
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "synthetic"
+        / "bridge_cable_small.json"
+    )
     out_dir = tmp_path / "run_out"
     out_dir.mkdir()
 

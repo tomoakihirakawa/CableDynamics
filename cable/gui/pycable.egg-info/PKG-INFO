@@ -87,7 +87,7 @@ make -j$(sysctl -n hw.logicalcpu)
 Verify either build with:
 
 ```bash
-./cable_solver <cable/gui>/examples/catenary_500m.json /tmp/cable_out/
+./cable_solver <cable/gui>/examples/synthetic/catenary_500m.json /tmp/cable_out/
 python -m json.tool /tmp/cable_out/result.json | head -15
 ```
 

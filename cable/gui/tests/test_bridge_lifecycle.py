@@ -58,7 +58,12 @@ def test_finished_fires_exactly_once_on_happy_path(qapp, solver_path):
     bridge.error_occurred.connect(lambda _: counts.__setitem__("error", counts["error"] + 1))
     bridge.finished.connect(qapp.quit)
 
-    example = Path(__file__).resolve().parents[1] / "examples" / "catenary_500m.json"
+    example = (
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "synthetic"
+        / "catenary_500m.json"
+    )
     params = CableParams.read_json(example)
     QTimer.singleShot(0, lambda: bridge.run_equilibrium(params))
 
@@ -120,7 +125,12 @@ def test_second_run_resets_state(qapp, solver_path):
 
     bridge.finished.connect(on_finished)
 
-    example = Path(__file__).resolve().parents[1] / "examples" / "bridge_cable_small.json"
+    example = (
+        Path(__file__).resolve().parents[1]
+        / "examples"
+        / "synthetic"
+        / "bridge_cable_small.json"
+    )
     params = CableParams.read_json(example)
     QTimer.singleShot(0, lambda: bridge.run_equilibrium(params))
 

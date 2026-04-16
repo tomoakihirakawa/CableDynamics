@@ -117,7 +117,8 @@ class CableBridge(QObject):
         self.run_system(sys_params)
 
     def run_system(self, params: "LumpedCableSystemParams",
-                   extra_json: dict | None = None) -> None:
+                   extra_json: dict | None = None,
+                   source_path: "Path | None" = None) -> None:
         """Start a solver process for a multi-cable system.
 
         Parameters
@@ -155,16 +156,50 @@ class CableBridge(QObject):
             cache_root = os.path.join(Path.home(), ".cache", "pycable", "runs")
             self._tmp_dir = os.path.join(cache_root, timestamp)
         os.makedirs(self._tmp_dir, exist_ok=True)
-        input_path = Path(self._tmp_dir) / "input.json"
-        params.write_json(input_path)
 
-        # Merge extra keys (initial_condition, tension, etc.) into the JSON
-        if extra_json:
-            with input_path.open() as f:
-                d = json.load(f)
-            d.update(extra_json)
+        # If source_path is already a solver-readable settings/per-cable file,
+        # preserve that schema. Regenerating through LumpedCableSystemParams can
+        # turn per-cable dynamic input into legacy multi-line input, and that
+        # path intentionally only supports static equilibrium.
+        source_data: dict | None = None
+        if source_path is not None and Path(source_path).exists():
+            try:
+                with Path(source_path).open() as f:
+                    sd = json.load(f)
+                if "input_files" in sd:
+                    src_dir = Path(source_path).parent
+                    source_data = dict(sd)
+                    # The copied settings.json lives in the run directory, so
+                    # make relative input_files absolute before launching.
+                    abs_input_files = []
+                    for fname in sd["input_files"]:
+                        fp = Path(fname).expanduser()
+                        if not fp.is_absolute():
+                            fp = src_dir / fp
+                        abs_input_files.append(str(fp.resolve()))
+                    source_data["input_files"] = abs_input_files
+                elif "end_a_position" in sd:
+                    source_data = dict(sd)
+            except Exception:
+                source_data = None
+
+        if source_data is not None:
+            input_path = Path(self._tmp_dir) / "input.json"
+            if extra_json:
+                source_data.update(extra_json)
             with input_path.open("w") as f:
-                json.dump(d, f, indent=2)
+                json.dump(source_data, f, indent=2)
+        else:
+            input_path = Path(self._tmp_dir) / "input.json"
+            params.write_json(input_path)
+
+            # Merge extra keys (initial_condition, tension, etc.) into the JSON
+            if extra_json:
+                with input_path.open() as f:
+                    d = json.load(f)
+                d.update(extra_json)
+                with input_path.open("w") as f:
+                    json.dump(d, f, indent=2)
 
         self._stdout_log = []
         self._stopped_by_user = False
@@ -212,8 +247,12 @@ class CableBridge(QObject):
                     continue
                 self.snapshot_ready.emit(snap)
                 iter_val = snap.get("iter", "?")
-                norm_v = snap.get("norm_v", float("nan"))
-                self.log_received.emit(f"iter {iter_val}  |v|_max={norm_v:.6g}")
+                if "t" in snap:
+                    # Dynamic mode: show time instead of |v|_max
+                    self.log_received.emit(f"t={snap['t']:.3f}s  iter {iter_val}")
+                else:
+                    norm_v = snap.get("norm_v", float("nan"))
+                    self.log_received.emit(f"iter {iter_val}  |v|_max={norm_v:.6g}")
             else:
                 self.log_received.emit(line)
 
@@ -249,7 +288,47 @@ class CableBridge(QObject):
 
         result_path = Path(self._tmp_dir) / "result.json"
         if not result_path.is_file():
-            self.error_occurred.emit(f"Result file not produced: {result_path}")
+            # Settings-mode (per-cable output): aggregate *_result.json files
+            # into the consolidated schema the GUI expects.
+            per_cable = sorted(Path(self._tmp_dir).glob("*_result.json"))
+            if not per_cable:
+                self.error_occurred.emit(f"Result file not produced: {result_path}")
+                return
+            agg = {"n_cables": len(per_cable), "converged": True,
+                   "computation_time_ms": 0.0, "cables": {}}
+            for pc in per_cable:
+                try:
+                    with pc.open() as f:
+                        d = json.load(f)
+                except Exception:
+                    continue
+                name = d.get("name", pc.stem.replace("_result", ""))
+                # Normalize: dynamic results have positions_final; static have positions
+                positions = d.get("positions") or d.get("positions_final") or []
+                # Dynamic per-cable result lacks per-node tensions; fall back to
+                # top/bottom tensions or empty list.
+                tensions = d.get("tensions", [])
+                top_t = d.get("top_tension")
+                bot_t = d.get("bottom_tension")
+                if isinstance(top_t, list): top_t = top_t[-1] if top_t else 0
+                if isinstance(bot_t, list): bot_t = bot_t[-1] if bot_t else 0
+                # If per-node tensions missing, synthesize a linear ramp from
+                # bottom_tension to top_tension so the color map has data.
+                if (not tensions) and positions and top_t is not None and bot_t is not None:
+                    n = len(positions)
+                    if n >= 2:
+                        tensions = [bot_t + (top_t - bot_t) * i / (n - 1)
+                                    for i in range(n)]
+                agg["cables"][name] = {
+                    "n_nodes": len(positions),
+                    "positions": positions,
+                    "tensions": tensions,
+                    "top_tension": top_t or 0,
+                    "bottom_tension": bot_t or 0,
+                    "converged": d.get("converged", True),
+                }
+                agg["computation_time_ms"] += d.get("computation_time_ms", 0)
+            self.result_ready.emit(agg)
             return
 
         try:

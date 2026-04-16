@@ -8,6 +8,7 @@ import numpy as np
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
+    QApplication,
     QDockWidget,
     QFileDialog,
     QHBoxLayout,
@@ -15,13 +16,17 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
 from ..bridge import CableBridge
 from ..params import CableParams, CableSpec, LumpedCableSystemParams, PerCableParams
+from .bodies_list import BodiesListWidget, BodySpec
+from .body_editor import BodyEditorDialog
 from .lines_list import LinesListWidget
+from .time_player import TimePlayerWidget
 from .log_panel import LogPanel
 from .run_history import RunHistoryWidget
 from .setup_panel import SetupPanel
@@ -32,11 +37,27 @@ class MainWindow(QMainWindow):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("pycable — Cable Dynamics GUI")
-        self.resize(1280, 800)
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1280, screen.width() - 50), min(800, screen.height() - 50))
 
-        # ---- Central 3D view ----
+        # ---- Central 3D view with time player below ----
         self._view_3d = View3D()
-        self.setCentralWidget(self._view_3d)
+        self._time_player = TimePlayerWidget()
+        self._time_player.time_changed.connect(self._on_time_changed)
+        self._time_player.show_static_changed.connect(
+            self._view_3d.set_static_cables_visible
+        )
+        self._time_player.contour_settings_changed.connect(self._on_contour_settings_changed)
+        # Per-run animation frames: {cable_name: [(t, positions_array), ...]}
+        self._animation_frames: dict[str, list] = {}
+
+        central = QWidget()
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self._view_3d, stretch=1)
+        central_layout.addWidget(self._time_player)
+        self.setCentralWidget(central)
 
         # ---- Left dock: lines list (top) + parameter forms (below) ----
         self._lines_list = LinesListWidget()
@@ -49,16 +70,28 @@ class MainWindow(QMainWindow):
         # Insert Run All into SetupPanel's Run button row
         self._setup_panel.add_run_all_button(self._btn_run_all)
 
+        self._bodies_list = BodiesListWidget()
+        self._loaded_bodies: list[BodySpec] = []
+        self._loaded_body_paths: list[Path] = []
+        self._bodies_list.body_double_clicked.connect(self._on_body_double_clicked)
+
         left_container = QWidget()
         left_layout = QVBoxLayout(left_container)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(4)
+        left_layout.addWidget(QLabel("Bodies in system"))
+        left_layout.addWidget(self._bodies_list)
         left_layout.addWidget(QLabel("Cables in system"))
         left_layout.addWidget(self._lines_list)
         left_layout.addWidget(self._setup_panel, stretch=1)
 
+        left_scroll = QScrollArea()
+        left_scroll.setWidget(left_container)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
         left_dock = QDockWidget("Parameters", self)
-        left_dock.setWidget(left_container)
+        left_dock.setWidget(left_scroll)
         left_dock.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetMovable
             | QDockWidget.DockWidgetFeature.DockWidgetFloatable
@@ -175,15 +208,26 @@ class MainWindow(QMainWindow):
 
         # Show the first cable's params in the form (or do nothing if empty).
         if system.cables:
-            self._setup_panel.set_params(
-                system.cables[0].to_cable_params(
-                    gravity=system.gravity,
-                    mode=system.mode,
-                    max_equilibrium_steps=system.max_equilibrium_steps,
-                    equilibrium_tol=system.equilibrium_tol,
-                    snapshot_interval=system.snapshot_interval,
-                )
+            cp = system.cables[0].to_cable_params(
+                gravity=system.gravity,
+                mode=system.mode,
+                max_equilibrium_steps=system.max_equilibrium_steps,
+                equilibrium_tol=system.equilibrium_tol,
+                snapshot_interval=system.snapshot_interval,
             )
+            # Propagate system-level fluid/wind to the displayed CableParams
+            cp.fluid = system.fluid
+            cp.fluid_density = system.fluid_density
+            cp.drag_Cd = system.drag_Cd
+            cp.wind_type = system.wind_type
+            cp.wind_U_mean = system.wind_U_mean
+            cp.wind_turbulence_intensity = system.wind_turbulence_intensity
+            cp.wind_integral_time_scale = system.wind_integral_time_scale
+            cp.wind_seed = system.wind_seed
+            cp.dt = system.dt
+            cp.t_end = system.t_end
+            cp.output_interval = system.output_interval
+            self._setup_panel.set_params(cp)
             # Apply per-cable initial condition info if available
             if self._loaded_per_cable:
                 pc = self._loaded_per_cable[0]
@@ -205,6 +249,19 @@ class MainWindow(QMainWindow):
             equilibrium_tol=self._loaded_system.equilibrium_tol,
             snapshot_interval=self._loaded_system.snapshot_interval,
         )
+        # Propagate system-level fluid/wind to the displayed CableParams
+        sys = self._loaded_system
+        params.fluid = sys.fluid
+        params.fluid_density = sys.fluid_density
+        params.drag_Cd = sys.drag_Cd
+        params.wind_type = sys.wind_type
+        params.wind_U_mean = sys.wind_U_mean
+        params.wind_turbulence_intensity = sys.wind_turbulence_intensity
+        params.wind_integral_time_scale = sys.wind_integral_time_scale
+        params.wind_seed = sys.wind_seed
+        params.dt = sys.dt
+        params.t_end = sys.t_end
+        params.output_interval = sys.output_interval
         self._setup_panel.set_params(params)
         # Apply per-cable initial condition info if available
         if idx < len(self._loaded_per_cable):
@@ -441,13 +498,35 @@ class MainWindow(QMainWindow):
                 QSettings("pycable", "pycable").setValue("output_dir", str(out_dir))
                 self._log_panel.append_line(f"[pycable] output_directory: {out_dir}")
 
+            self._loaded_bodies = []
+            self._loaded_body_paths = []
             if "input_files" in _top:
                 for fname in _top["input_files"]:
                     cable_path = p.parent / fname
                     if cable_path.exists():
+                        with cable_path.open() as _fb:
+                            _sub = _json.load(_fb)
+                        if "RigidBody" in str(_sub.get("type", "")):
+                            self._loaded_bodies.append(BodySpec(
+                                name=str(_sub.get("name", cable_path.stem)),
+                                type=str(_sub.get("type", "RigidBody")),
+                                velocity=list(_sub.get("velocity", [])) if isinstance(
+                                    _sub.get("velocity"), list) else [],
+                            ))
+                            self._loaded_body_paths.append(cable_path)
+                            continue  # body file, not a cable
                         self._loaded_per_cable.append(PerCableParams.read_json(cable_path))
             elif "end_a_position" in _top:
                 self._loaded_per_cable.append(PerCableParams.from_dict(_top))
+            elif "point_a" in _top:
+                legacy = CableParams.from_dict(_top)
+                pc = PerCableParams.from_cable_params(legacy, name=str(_top.get("name", p.stem)))
+                pc.initial_condition = str(_top.get("initial_condition", "length"))
+                pc.tension = float(_top.get("tension", 0.0))
+                pc.tension_top = float(_top.get("tension_top", 0.0))
+                pc.tension_bottom = float(_top.get("tension_bottom", 0.0))
+                self._loaded_per_cable.append(pc)
+            self._bodies_list.populate(self._loaded_bodies)
         except Exception:
             pass  # fallback: no per-cable info
 
@@ -556,6 +635,11 @@ class MainWindow(QMainWindow):
         Mirrors the form edits back into ``_loaded_system`` so that a user
         who edits the selected cable and hits Run gets the modified
         parameters saved into the loaded system as well.
+
+        If the loaded JSON is a settings.json with body files (cantilever,
+        sinusoidal, etc.), the selected cable is run inside a filtered
+        settings.json that still references the body files — so body-driven
+        dynamic analysis of a single cable works.
         """
         self._sync_form_into_loaded_system(params)
         self._system_run_active = False
@@ -563,14 +647,244 @@ class MainWindow(QMainWindow):
         self._log_panel.append_line(f"[pycable] solver = {self._bridge.solver_path}")
         self._log_panel.append_line(
             f"[pycable] run selected cable  length={params.cable_length:g}  "
-            f"n_segments={params.n_segments}  EA={params.EA:g}"
+            f"n_segments={params.n_segments}  EA={params.EA:g}  mode={params.mode}"
         )
         self._view_3d.clear_for_new_run()
         self._view_3d.show_endpoints(params.point_a, params.point_b)
 
+        # Path A: the loaded source has body files → generate a filtered
+        # settings.json that references [bodies + selected cable file] and
+        # pass it as source_path so bridge.run_system takes the
+        # ``use_source_directly`` branch and preserves body driving.
+        selected_name = None
+        if (self._loaded_system is not None
+                and self._loaded_system.cables):
+            idx = max(0, self._lines_list.selected_index())
+            if idx < len(self._loaded_system.cables):
+                selected_name = self._loaded_system.cables[idx].name
+        tmp_settings = self._maybe_make_filtered_settings(
+            params, cables_filter=selected_name,
+        )
+        if tmp_settings is not None:
+            self._log_panel.append_line(
+                f"[pycable] body-preserving run via {tmp_settings.name}"
+            )
+            # LumpedCableSystemParams is still required as first arg but
+            # unused when source_path triggers use_source_directly.
+            sys_params = LumpedCableSystemParams.from_cable_params(params)
+            self._bridge.run_system(sys_params, source_path=tmp_settings)
+            return
+
+        # Path B: no bodies and the loaded cable came from canonical
+        # per-cable JSON. Keep that schema so dynamic mode and tension-based
+        # initial conditions are preserved.
+        per_cable_input = self._write_current_per_cable_input(
+            params, selected_name=selected_name,
+        )
+        if per_cable_input is not None:
+            self._log_panel.append_line(
+                f"[pycable] per-cable run via {per_cable_input.name}"
+            )
+            sys_params = LumpedCableSystemParams.from_cable_params(
+                params, name=self._current_per_cable_name(selected_name)
+            )
+            self._bridge.run_system(sys_params, source_path=per_cable_input)
+            return
+
+        # Path C: no loaded per-cable source — fall back to the historical
+        # standalone single-cable JSON.
+        # JSON as before.
         extra = self._collect_extra_json()
         sys_params = LumpedCableSystemParams.from_cable_params(params)
         self._bridge.run_system(sys_params, extra_json=extra)
+
+    def _current_per_cable_name(self, selected_name: str | None = None) -> str:
+        """Return the stable name for the currently selected cable."""
+        if selected_name:
+            return selected_name
+        idx = max(0, self._lines_list.selected_index())
+        if self._loaded_system is not None and idx < len(self._loaded_system.cables):
+            return self._loaded_system.cables[idx].name
+        if idx < len(self._loaded_per_cable):
+            return self._loaded_per_cable[idx].name
+        return "cable"
+
+    def _per_cable_from_form(
+        self,
+        params: CableParams,
+        selected_name: str | None = None,
+    ) -> PerCableParams | None:
+        """Build canonical per-cable input from the visible form.
+
+        Existing PerCableParams are used as a base so body labels and endpoint
+        motion keys survive form edits. The visible form then overrides the
+        solver/geometry/material fields.
+        """
+        if not self._loaded_per_cable:
+            return None
+        idx = max(0, self._lines_list.selected_index())
+        base = self._loaded_per_cable[idx] if idx < len(self._loaded_per_cable) else None
+        if base is None:
+            return None
+
+        pc = PerCableParams.from_dict(base.to_dict())
+        pc.name = self._current_per_cable_name(selected_name)
+        pc.end_a_position = tuple(params.point_a)
+        pc.end_b_position = tuple(params.point_b)
+        pc.cable_length = params.cable_length
+        pc.n_points = params.n_segments + 1
+        pc.line_density = params.line_density
+        pc.EA = params.EA
+        pc.damping = params.damping
+        pc.diameter = params.diameter
+        pc.gravity = params.gravity
+        pc.mode = params.mode
+        pc.max_equilibrium_steps = params.max_equilibrium_steps
+        pc.equilibrium_tol = params.equilibrium_tol
+        pc.snapshot_interval = params.snapshot_interval
+        pc.dt = params.dt
+        pc.t_end = params.t_end
+        pc.output_interval = params.output_interval
+        pc.fluid = params.fluid
+        pc.fluid_density = params.fluid_density
+        pc.drag_Cd = params.drag_Cd
+        pc.wind_type = params.wind_type
+        pc.wind_U_mean = params.wind_U_mean
+        pc.wind_turbulence_intensity = params.wind_turbulence_intensity
+        pc.wind_integral_time_scale = params.wind_integral_time_scale
+        pc.wind_seed = params.wind_seed
+
+        ic = self._setup_panel.combo_initial_cond.currentText()
+        pc.initial_condition = ic
+        if ic == "tension":
+            pc.tension_top = self._setup_panel.spin_tension_top.value()
+            pc.tension_bottom = self._setup_panel.spin_tension_bot.value()
+            pc.tension = 0.0
+        else:
+            pc.tension = 0.0
+            pc.tension_top = 0.0
+            pc.tension_bottom = 0.0
+        return pc
+
+    def _write_current_per_cable_input(
+        self,
+        params: CableParams,
+        selected_name: str | None = None,
+    ) -> Path | None:
+        """Write a canonical per-cable input for the next solver run."""
+        pc = self._per_cable_from_form(params, selected_name=selected_name)
+        if pc is None:
+            return None
+
+        from datetime import datetime
+        import re
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", pc.name).strip("_") or "cable"
+        base = Path(self._bridge.output_dir) if self._bridge.output_dir else (
+            Path.home() / ".cache" / "pycable" / "runs"
+        )
+        tmp_dir = base / f"{ts}_input_{safe_name}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        input_path = tmp_dir / "input.json"
+        pc.write_json(input_path)
+        return input_path
+
+    def _maybe_make_filtered_settings(
+        self,
+        params: CableParams,
+        cables_filter: str | None = None,
+    ) -> Path | None:
+        """Write a settings.json derived from the currently-loaded one, so
+        that (a) mode/dt/t_end from the form override the on-disk values
+        and (b) an optional cables_filter keeps only one cable.
+
+        Returns the written path, or None if the current load state does
+        not support this (no bodies, no source, etc.).
+
+        ``cables_filter``:
+        - None → include all non-body cables
+        - str  → include only the cable whose name matches
+        """
+        if not self._loaded_bodies or not self._loaded_body_paths:
+            return None
+        if self._last_loaded_path is None or not self._last_loaded_path.exists():
+            return None
+        try:
+            import json as _json
+            with self._last_loaded_path.open() as f:
+                orig = _json.load(f)
+        except Exception:
+            return None
+        if "input_files" not in orig:
+            return None
+
+        src_dir = self._last_loaded_path.parent
+        body_file_names: list[str] = []
+        cable_file_names: list[str] = []
+        for fname in orig["input_files"]:
+            fpath = src_dir / fname
+            if not fpath.exists():
+                continue
+            try:
+                with fpath.open() as ff:
+                    sub = _json.load(ff)
+            except Exception:
+                continue
+            if "RigidBody" in str(sub.get("type", "")):
+                body_file_names.append(fname)
+                continue
+            sub_name = str(sub.get("name", Path(fname).stem))
+            if cables_filter is None or sub_name == cables_filter:
+                cable_file_names.append(fname)
+
+        if not cable_file_names or not body_file_names:
+            return None
+
+        # Destination tag: "selected_C01" or "all" for traceability.
+        tag = f"selected_{cables_filter}" if cables_filter else "all"
+
+        from datetime import datetime
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = Path(self._bridge.output_dir) if self._bridge.output_dir else (
+            Path.home() / ".cache" / "pycable" / "runs"
+        )
+        tmp_dir = base / f"{ts}_{tag}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        tmp_settings = tmp_dir / "settings.json"
+
+        # Reference by absolute path so the filtered file can live anywhere.
+        abs_input_files = [
+            str((src_dir / n).resolve())
+            for n in (body_file_names + cable_file_names)
+        ]
+
+        filtered: dict = {
+            "input_files": abs_input_files,
+            "gravity": float(params.gravity),
+            "mode": str(params.mode),
+            "max_equilibrium_steps": int(params.max_equilibrium_steps),
+            "equilibrium_tol": float(params.equilibrium_tol),
+            "snapshot_interval": int(params.snapshot_interval),
+        }
+        if params.mode == "dynamic":
+            filtered["dt"] = float(params.dt)
+            filtered["t_end"] = float(params.t_end)
+            if params.output_interval > 0:
+                filtered["output_interval"] = float(params.output_interval)
+        # Propagate fluid/wind settings — otherwise the derived file falls
+        # back to solver default "water" which breaks bridge runs that need
+        # fluid=air.
+        from ..params import _fluid_wind_to_dict
+        filtered.update(_fluid_wind_to_dict(params))
+        extra = self._collect_extra_json()
+        if extra:
+            filtered.update(extra)
+
+        import json as _json
+        with tmp_settings.open("w") as f:
+            _json.dump(filtered, f, indent=2)
+        return tmp_settings
 
     def _on_run_system_triggered(self) -> None:
         """Run the whole loaded ``LumpedCableSystemParams`` in one invocation."""
@@ -605,8 +919,37 @@ class MainWindow(QMainWindow):
                 f"  [{ci + 1}/{n}] {cable.name}  length={cable.cable_length:g}  "
                 f"n_points={cable.n_points}"
             )
+        form_params = self._setup_panel.collect_params()
+        # If bodies are loaded, generate a derived settings.json so form
+        # overrides (mode/dt/t_end) take effect even when running full
+        # system.  _maybe_make_filtered_settings(cables_filter=None)
+        # includes every cable.
+        tmp_settings = self._maybe_make_filtered_settings(
+            form_params, cables_filter=None,
+        )
+        if tmp_settings is not None:
+            self._log_panel.append_line(
+                f"[pycable] body-preserving run via {tmp_settings.name}"
+            )
+            self._bridge.run_system(self._loaded_system,
+                                    source_path=tmp_settings)
+            return
+
+        if len(self._loaded_per_cable) == 1 and not self._loaded_bodies:
+            per_cable_input = self._write_current_per_cable_input(form_params)
+            if per_cable_input is not None:
+                self._log_panel.append_line(
+                    f"[pycable] per-cable run via {per_cable_input.name}"
+                )
+                sys_params = LumpedCableSystemParams.from_cable_params(
+                    form_params, name=self._current_per_cable_name()
+                )
+                self._bridge.run_system(sys_params, source_path=per_cable_input)
+                return
+
         extra = self._collect_extra_json()
-        self._bridge.run_system(self._loaded_system, extra_json=extra)
+        self._bridge.run_system(self._loaded_system, extra_json=extra,
+                                source_path=self._last_loaded_path)
 
     def _collect_extra_json(self) -> dict | None:
         """Collect initial_condition / tension from the GUI form into a dict
@@ -645,15 +988,134 @@ class MainWindow(QMainWindow):
         self._loaded_system.max_equilibrium_steps = params.max_equilibrium_steps
         self._loaded_system.equilibrium_tol = params.equilibrium_tol
         self._loaded_system.snapshot_interval = params.snapshot_interval
+        self._loaded_system.dt = params.dt
+        self._loaded_system.t_end = params.t_end
+        self._loaded_system.output_interval = params.output_interval
+        # Fluid/wind are system-level — sync from form into loaded system.
+        self._loaded_system.fluid = params.fluid
+        self._loaded_system.fluid_density = params.fluid_density
+        self._loaded_system.drag_Cd = params.drag_Cd
+        self._loaded_system.wind_type = params.wind_type
+        self._loaded_system.wind_U_mean = params.wind_U_mean
+        self._loaded_system.wind_turbulence_intensity = params.wind_turbulence_intensity
+        self._loaded_system.wind_integral_time_scale = params.wind_integral_time_scale
+        self._loaded_system.wind_seed = params.wind_seed
 
     def _on_started(self) -> None:
         self._setup_panel.set_running(True)
         self._btn_run_all.setEnabled(False)
         self._setup_panel.set_status("Running…")
+        # Reset playback frames and cached strain tables for the new run.
+        self._animation_frames = {}
+        self._anim_ref_lengths = {}
+        self._anim_strain_clim = None
+        self._time_player.clear()
+        self._view_3d.clear_fast_cables()
+        self._view_3d.clear_static_cables()
 
     def _on_finished(self) -> None:
         self._setup_panel.set_running(False)
         self._btn_run_all.setEnabled(True)
+        # Build the union of all times across cables for the time slider.
+        all_times = set()
+        for frames in self._animation_frames.values():
+            for t, _pos in frames:
+                all_times.add(t)
+        if all_times:
+            self._time_player.set_times(sorted(all_times))
+
+    def _on_body_double_clicked(self, idx: int) -> None:
+        """Open BodyEditorDialog for the selected body."""
+        if idx < 0 or idx >= len(self._loaded_bodies):
+            return
+        body = self._loaded_bodies[idx]
+        path = self._loaded_body_paths[idx] if idx < len(self._loaded_body_paths) else None
+        if path is None:
+            return
+        dlg = BodyEditorDialog(body, path, parent=self)
+        if dlg.exec() == BodyEditorDialog.DialogCode.Accepted:
+            # Refresh list label (motion may have changed)
+            self._bodies_list.populate(self._loaded_bodies)
+            self._log_panel.append_line(
+                f"[pycable] body '{body.name}' updated → {path.name}"
+            )
+
+    def _on_time_changed(self, t: float) -> None:
+        """Redraw every loaded cable at the frame closest to time ``t`` with
+        per-node tension-proxy contour (segment strain relative to the
+        equilibrium catenary in the first frame)."""
+        from .view_3d import cable_color_by_index
+        if not self._animation_frames:
+            return
+        # When the scrubber drives the view, remove the static final-tension
+        # actors so the animation is the single authoritative display layer.
+        self._view_3d.clear_all_result_cables()
+        loaded = self._loaded_system
+        names = [c.name for c in loaded.cables] if loaded else list(self._animation_frames)
+
+        # Cache the reference (first-frame) segment lengths and the global
+        # strain range once per run so the colormap is stable across frames.
+        if not hasattr(self, "_anim_ref_lengths") or not self._anim_ref_lengths:
+            self._anim_ref_lengths = {}
+            for name, frames in self._animation_frames.items():
+                if not frames:
+                    continue
+                p0 = frames[0][1]
+                seg = np.linalg.norm(np.diff(p0, axis=0), axis=1)
+                self._anim_ref_lengths[name] = np.maximum(seg, 1e-12)
+            # Global strain range for a shared colormap
+            smax = 0.0
+            for name, frames in self._animation_frames.items():
+                ref = self._anim_ref_lengths.get(name)
+                if ref is None:
+                    continue
+                for _tt, pp in frames:
+                    seg = np.linalg.norm(np.diff(pp, axis=0), axis=1)
+                    strain = (seg - ref) / ref
+                    smax = max(smax, float(np.max(np.abs(strain))))
+            self._anim_strain_clim = (-smax, smax) if smax > 0 else (-1e-6, 1e-6)
+
+        for idx, name in enumerate(names):
+            frames = self._animation_frames.get(name)
+            if not frames:
+                continue
+            best = min(frames, key=lambda tp: abs(tp[0] - t))
+            positions = best[1]
+            ref = self._anim_ref_lengths.get(name)
+            scalars = None
+            if ref is not None and len(ref) == positions.shape[0] - 1:
+                seg = np.linalg.norm(np.diff(positions, axis=0), axis=1)
+                strain_seg = (seg - ref) / ref  # per segment
+                # Convert to per-node by averaging neighboring segments
+                strain_node = np.empty(positions.shape[0], dtype=float)
+                strain_node[0] = strain_seg[0]
+                strain_node[-1] = strain_seg[-1]
+                strain_node[1:-1] = 0.5 * (strain_seg[:-1] + strain_seg[1:])
+                scalars = strain_node
+            cs = self._time_player.contour_settings
+            clim = self._anim_strain_clim
+            if not cs["auto_range"]:
+                clim = (cs["vmin"], cs["vmax"])
+            self._view_3d.update_cable_fast(
+                name, positions,
+                color=cable_color_by_index(idx),
+                scalars=scalars,
+                clim=clim,
+                cmap=cs["cmap"],
+            )
+        self._view_3d.render_now()
+
+    def _on_contour_settings_changed(self, _settings: dict) -> None:
+        """Re-render the current animation frame with the new contour settings.
+
+        Forces recreation of PyVista actors so the new colormap / clim takes
+        effect immediately (otherwise the cached actors keep the old cmap).
+        """
+        self._view_3d.clear_fast_cables()
+        if self._animation_frames and self._time_player._times:
+            idx = self._time_player._slider.value()
+            if 0 <= idx < len(self._time_player._times):
+                self._on_time_changed(self._time_player._times[idx])
 
     def _on_snapshot(self, snap: dict) -> None:
         if self._in_multi_mode:
@@ -673,11 +1135,22 @@ class MainWindow(QMainWindow):
         positions_arr = np.asarray(positions, dtype=float)
         iter_val = snap.get("iter", "?")
 
+        # Collect time-series frame for post-run playback (dynamic mode only,
+        # when snapshot carries a "t" field).
+        t_snap = snap.get("t")
+        cable_name = snap.get("cable")
+        if t_snap is not None and cable_name is not None:
+            # First frame for this cable → capture as static equilibrium reference.
+            if cable_name not in self._animation_frames:
+                self._view_3d.set_static_cable(cable_name, positions_arr)
+            self._animation_frames.setdefault(cable_name, []).append(
+                (float(t_snap), positions_arr.copy())
+            )
+
         # Multi-line SNAPSHOT demux: when cable_solver is running in
         # multi-line mode each snapshot is tagged with the cable name.
         # We append each into the accumulated result-cable actors so the
         # user sees all N cables moving together during equilibration.
-        cable_name = snap.get("cable")
         if cable_name is not None:
             loaded = self._loaded_system
             idx = 0
